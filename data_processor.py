@@ -4,7 +4,7 @@ import numpy as np
 def load_data(filepath: str) -> pd.DataFrame:
     """Load the ERAS dataset and strip the trailing ghost column."""
     # Load the file
-    df = pd.read_csv(filepath, sep=';', low_memory=False)
+    df = pd.read_csv(filepath, sep=',', low_memory=False)
     
     return df
 
