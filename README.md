@@ -11,6 +11,33 @@ This goal of this hackathon is to create new synthetic data of medical records
 
 ## Setup Instructions
 
+### 1. Install Visual Studio Code (VS Code)
+Download the installer from code.visualstudio.com.
+
+Run the installer and follow the instructions.
+
+Once open, go to the Extensions view (square icon on the left) and search for "Python" (by Microsoft) and click Install.
+
+### 2. Install Python
+### Windows
+Download the installer from python.org.
+
+IMPORTANT: Check the box "Add Python to PATH" at the start of the installation. If you miss this, the python command won't work in your terminal.
+
+Verify in PowerShell: python --version
+
+### macOS
+macOS comes with an older version of Python. Install the latest version using Homebrew: brew install python or download the .pkg from python.org.
+
+Verify in Terminal: python3 --version (Note: You usually must use python3, not python).
+
+### Linux (Ubuntu/Debian)
+Update your package manager: sudo apt update
+
+Install Python: sudo apt install python3 python3-venv python3-pip
+
+Verify: python3 --version
+
 ### 1. Create a Virtual Environment
 Open your terminal in the project folder and run:
 

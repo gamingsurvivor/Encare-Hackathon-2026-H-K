@@ -1,4 +1,4 @@
-import datetime
+from datetime import datetime
 import os
 import pandas as pd
 from pathlib import Path
@@ -17,7 +17,7 @@ def main():
     results_dir = Path("results")
 
     # File paths
-    input_file = data_dir / "synthetic-data-hackaton-sample.csv"
+    input_file = data_dir / "data.csv"
     
     # Phase 1: Data loading and cleaning
     if not input_file.exists():
@@ -25,12 +25,14 @@ def main():
         return
 
     raw_data = load_data(str(input_file))
-    df_clean = preprocess_for_synthesis(raw_data, max_columns=20)
+    
+    #Decomment if dataprocessing is used
+    #df_clean = preprocess_for_synthesis(raw_data)
+    df_clean = raw_data
 
     # Phase 2: Synthetic Data Generation
-    # Gaussian Copula is used as a baseline approach
     print("\nGenerate synthetic data: ")
-    synthetic_df = run_random_sample(df_clean, num_samples=200)
+    synthetic_df = run_random_sample(df_clean, num_samples=8000)
 
     # Phase 3: Quality Assurance
     # Compares the cleaned source data against the generated output
@@ -40,7 +42,7 @@ def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
 
     # Create the unique filename
-    output_filename = f"synthetic_records_{timestamp}.csv"
+    output_filename = f"synthetic_data_{timestamp}.csv"
     output_path = results_dir / output_filename
 
     # Save to the specific folder
