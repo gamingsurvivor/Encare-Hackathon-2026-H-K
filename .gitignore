@@ -5,3 +5,4 @@ data/*.csv
 results/*.csv
 __pycache__/
 approaches/__pycache__/
+.Rproj.user
