@@ -9,6 +9,7 @@ Create a fork and make the fork private!
 - `/results`: Synthetic outputs will be saved here with timestamps.
 - `/examples`: Baseline generators (e.g., Random Sampler).
 - `data_processor.py`: Cleaning and imputation logic.
+- `data_validator.py`: Function that validates the submission locally before submitting to the platform. 
 - `validator.py`: Statistical (KS-test) and clinical validation.
 
 ## Setup Instructions
