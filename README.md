@@ -1,6 +1,8 @@
 # Encare Synthetic Data Hackathon
 
-This goal of this hackathon is to create new synthetic data of medical records
+This goal of this hackathon is to create new synthetic data of medical records.
+
+Create a fork and make the fork private!
 
 ## Project Structure
 - `/data`: Place your raw `synthetic-data-hackaton-sample.csv` here.
