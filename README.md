@@ -34,8 +34,10 @@ Verify in Terminal: python3 --version (Note: You usually must use python3, not p
 ### Linux (Ubuntu/Debian)
 Update your package manager: sudo apt update
 
-Install Python: sudo apt install python3 python3-venv python3-pip
-
+Install Python:
+```bash
+sudo apt install python3 python3-venv python3-pip
+```
 Verify: python3 --version
 
 ### 1. Create a Virtual Environment
