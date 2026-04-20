@@ -44,14 +44,32 @@ def preprocess_for_synthesis(df):
     numerical_cols = df_clean.select_dtypes(include=['int64', 'float64']).columns
     categorical_cols = df_clean.select_dtypes(include=['object', 'category']).columns
 
-    # 5. Impute Missing Values
-    # Fill numerical NaNs (including our new date/time integers) with the median
     for col in numerical_cols:
-        df_clean[col] = df_clean[col].fillna(df_clean[col].median())
+        median_val = df_clean[col].median()
+        # If the column was 100% missing, the median is NaN. Fallback to 0.
+        if pd.isna(median_val):
+            df_clean[col] = df_clean[col].fillna(0)
+        else:
+            df_clean[col] = df_clean[col].fillna(median_val)
 
     # Fill categorical NaNs with a new category 'Missing'
     for col in categorical_cols:
         df_clean[col] = df_clean[col].fillna('Missing')
+
+    # --- NEW: PREVENT DIMENSIONALITY EXPLOSION ---
+    # Drop categorical columns with more than 50 unique values (e.g., IDs, notes)
+    cols_to_drop = []
+    for col in categorical_cols:
+        if df_clean[col].nunique() > 50:
+            print(f"Dropping high-cardinality column to save memory: {col} ({df_clean[col].nunique()} unique values)")
+            cols_to_drop.append(col)
+            
+    df_clean.drop(columns=cols_to_drop, inplace=True)
+    # Update categorical_cols list so get_dummies doesn't look for dropped columns
+    categorical_cols = [c for c in categorical_cols if c not in cols_to_drop]
+
+    # 5. Encode Categorical Variables (One-Hot Encoding)
+    df_encoded = pd.get_dummies(df_clean, columns=categorical_cols, drop_first=False)
 
     # 6. Encode Categorical Variables
     df_encoded = pd.get_dummies(df_clean, columns=categorical_cols, drop_first=False)
@@ -66,11 +84,14 @@ def preprocess_for_synthesis(df):
     scaler = MinMaxScaler()
     cols_to_scale = [col for col in df_encoded.columns if df_encoded[col].max() > 1 or df_encoded[col].min() < 0]
     
-    df_encoded[cols_to_scale] = scaler.fit_transform(df_encoded[cols_to_scale])
+    # SAFETY CHECK: Only transform if there are actually columns to scale
+    if len(cols_to_scale) > 0:
+        df_encoded[cols_to_scale] = scaler.fit_transform(df_encoded[cols_to_scale])
 
     print("Final shape after encoding:", df_encoded.shape)
     
-    return df_encoded, scaler, date_cols, time_cols
+    # [!] FIX: Return cols_to_scale at the end
+    return df_encoded, scaler, date_cols, time_cols, cols_to_scale
 
 
 def postprocess_synthetic_data(synthetic_tensor, original_df, scaler, cols_to_scale, encoded_cols, categorical_cols, date_cols, time_cols):
@@ -87,7 +108,8 @@ def postprocess_synthetic_data(synthetic_tensor, original_df, scaler, cols_to_sc
     df_synth = pd.DataFrame(synthetic_array, columns=encoded_cols)
 
     # 2. Reverse the MinMaxScaler for continuous columns
-    df_synth[cols_to_scale] = scaler.inverse_transform(df_synth[cols_to_scale])
+    if len(cols_to_scale) > 0:
+        df_synth[cols_to_scale] = scaler.inverse_transform(df_synth[cols_to_scale])
 
     # 3. Reverse One-Hot Encoding for Categorical Variables
     for col in categorical_cols:

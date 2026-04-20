@@ -37,9 +37,10 @@ def main():
 
     # Run the robust preprocessing pipeline
     print("\nPreprocessing data...")
-    df_encoded, scaler, date_cols, time_cols = preprocess_for_synthesis(raw_data)
+    # [!] FIX: Unpack cols_to_scale directly from the function
+    df_encoded, scaler, date_cols, time_cols, cols_to_scale = preprocess_for_synthesis(raw_data)
     
-    # We need to capture the columns that were scaled so we can un-scale them later
+    # We need to capture these for the post-processor
     encoded_cols = df_encoded.columns.tolist()
     categorical_cols = raw_data.select_dtypes(include=['object', 'category']).columns.tolist()
     cols_to_scale = [col for col in encoded_cols if df_encoded[col].max() > 1 or df_encoded[col].min() < 0]
@@ -67,9 +68,12 @@ def main():
     discriminator = Discriminator(data_dim, condition_dim)
     generator = Generator(latent_dim, condition_dim, data_dim)
 
-    # Convert Pandas DataFrames to PyTorch Tensors
     X_train = torch.tensor(df_encoded[feature_cols].values, dtype=torch.float32)
     C_train = torch.tensor(df_encoded[condition_cols].values, dtype=torch.float32)
+
+    if torch.isnan(X_train).any() or torch.isnan(C_train).any():
+        print("CRITICAL ERROR: NaNs detected in the final tensor! Preprocessing failed.")
+        return
 
     # Create DataLoader
     batch_size = 64
