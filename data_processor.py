@@ -3,7 +3,7 @@ import numpy as np
 from sklearn.preprocessing import QuantileTransformer, LabelEncoder
 
 def load_data(filepath):
-    return pd.read_csv(filepath)
+    return pd.read_csv(filepath, low_memory=False)
 
 def preprocess_for_synthesis(df):
     print("Initial shape:", df.shape)
@@ -28,16 +28,26 @@ def preprocess_for_synthesis(df):
         if col not in numerical_cols: numerical_cols.append(col)
 
     # --- THE MASKING FIX FOR NUMERICAL DATA ---
+    # --- THE MASKING FIX FOR NUMERICAL DATA ---
     missing_flags = []
+    new_flag_cols = {} # Dictionary to hold our new columns temporarily
+    
     for col in numerical_cols:
         if df_clean[col].isna().any():
             flag_col = f"{col}_missing_flag"
-            df_clean[flag_col] = df_clean[col].isna().astype(float)
+            
+            # Store the mask in our dictionary instead of attaching it immediately
+            new_flag_cols[flag_col] = df_clean[col].isna().astype(float)
             missing_flags.append(flag_col)
             
             # Temporarily fill with median to fix the scaling math
             median_val = df_clean[col].median()
             df_clean[col] = df_clean[col].fillna(0 if pd.isna(median_val) else median_val)
+
+    # Attach all new columns at exactly the same time to prevent fragmentation
+    if new_flag_cols:
+        flags_df = pd.DataFrame(new_flag_cols)
+        df_clean = pd.concat([df_clean, flags_df], axis=1)
 
     # Categorical Missingness
     for col in categorical_cols:

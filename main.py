@@ -2,16 +2,51 @@ import os
 from datetime import datetime
 from pathlib import Path
 import pandas as pd
+import numpy as np
 import torch
 from torch import nn
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import TensorDataset, DataLoader, WeightedRandomSampler
 from dotenv import load_dotenv
 
+from CSVTester import SyntheticDataDiscriminator
 from data_processor import load_data, preprocess_for_synthesis, postprocess_synthetic_data
 from Discriminator import Discriminator
 from Generative import Generator, generate_synthetic_samples
 
 load_dotenv()
+
+# --- WGAN-GP Helper Function ---
+def compute_gradient_penalty(D, real_samples, fake_samples, conditions, device):
+    """Calculates the gradient penalty for WGAN to enforce the Lipschitz constraint."""
+    alpha = torch.rand(real_samples.size(0), 1).to(device)
+    interpolates = (alpha * real_samples + ((1 - alpha) * fake_samples)).requires_grad_(True)
+    
+    d_interpolates = D(interpolates, conditions)
+    fake = torch.ones(d_interpolates.size()).to(device)
+    
+    gradients = torch.autograd.grad(
+        outputs=d_interpolates,
+        inputs=interpolates,
+        grad_outputs=fake,
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True,
+    )[0]
+    
+    gradients = gradients.view(gradients.size(0), -1)
+    gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
+    return gradient_penalty
+
+def compute_correlation_matrix(x):
+    """Calculates the Pearson correlation matrix for a batch of data in PyTorch."""
+    # Center the data by subtracting the mean
+    x_centered = x - torch.mean(x, dim=0)
+    # Divide by standard deviation (adding a tiny epsilon so we never divide by zero)
+    std = torch.std(x, dim=0) + 1e-8
+    x_standardized = x_centered / std
+    # Calculate the correlation matrix
+    corr_matrix = torch.matmul(x_standardized.T, x_standardized) / (x.size(0) - 1)
+    return corr_matrix
 
 def main():
     data_dir = Path("data")
@@ -19,9 +54,8 @@ def main():
     results_dir.mkdir(exist_ok=True)
 
     input_file = data_dir / "data.csv"
-    
     if not input_file.exists():
-        print(f"Error: {input_file} not found. Please place the CSV in the 'data' folder.")
+        print("Error: CSV not found.")
         return
 
     raw_data = load_data(str(input_file))
@@ -31,95 +65,176 @@ def main():
     df_encoded, scaler, date_cols, time_cols, label_encoders, categorical_cols, missing_flags = preprocess_for_synthesis(raw_data)
     original_columns = raw_data.columns.tolist()
     
-    # ==========================================
-    # Phase 2: GAN Setup & PyTorch DataLoaders
-    # ==========================================
     TARGET_CONDITION = 'Complications at all during primary stay::183'
     condition_cols = [TARGET_CONDITION]
-    feature_cols = [col for col in df_encoded.columns.tolist() if col != TARGET_CONDITION]
+    all_feature_cols = [col for col in df_encoded.columns.tolist() if col != TARGET_CONDITION]
+
+    # ==========================================
+    # Phase 1.5: FEATURE PRUNING (Put GAN on a diet)
+    # ==========================================
+    print("\nPruning low-variance columns...")
+    variances = df_encoded[all_feature_cols].var()
+    # Keep columns that actually have variance (change). Drop dead columns.
+    feature_cols = variances[variances > 0.001].index.tolist()
+    pruned_cols = [c for c in all_feature_cols if c not in feature_cols]
     
+    # Save the most common value of the dropped columns so we can glue them back later
+    pruned_defaults = {c: df_encoded[c].mode()[0] for c in pruned_cols}
+    print(f"Kept {len(feature_cols)} features. Pruned {len(pruned_cols)} useless features.")
+
+    # ==========================================
+    # Phase 2: GAN Setup & Class Balancing
+    # ==========================================
     data_dim = len(feature_cols)
     condition_dim = len(condition_cols)
     latent_dim = 256 
     pack_size = 8
 
-    # --- THE GPU UPGRADE ---
-    # Detect Nvidia (cuda), Apple Silicon (mps), or fallback to CPU
     device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
-    print(f"\nInitializing CTGAN-Lite Models on: {device.type.upper()}...")
-    print(f"Features Dim: {data_dim} | Condition Dim: {condition_dim} | Latent Dim: {latent_dim}")
+    print(f"\nInitializing WGAN-GP Models on: {device.type.upper()}...")
 
-    # Initialize and immediately push models to the GPU
     discriminator = Discriminator(data_dim, condition_dim, pack_size=pack_size).to(device)
     generator = Generator(latent_dim, condition_dim, data_dim).to(device)
 
-    # Push the entire training dataset into GPU memory (tabular data is small enough to fit)
     X_train = torch.tensor(df_encoded[feature_cols].values, dtype=torch.float32).to(device)
     C_train = torch.tensor(df_encoded[condition_cols].values, dtype=torch.float32).to(device)
-    # -----------------------
+
+    # --- CLASS BALANCING (Force 50/50 Sick vs Healthy during training) ---
+    # Look at the raw, unscaled text data to safely count the classes
+    raw_target = raw_data[TARGET_CONDITION].astype(str).fillna('Unknown')
+    class_counts = raw_target.value_counts()
+    
+    # Map the count weights back to each individual row
+    sample_weights = raw_target.map(lambda x: 1.0 / class_counts[x]).values
+    
+    sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
+    # ---------------------------------------------------------------------
+    # ---------------------------------------------------------------------
 
     batch_size = 64
     dataset = TensorDataset(X_train, C_train)
-    train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True) 
+    # Note: 'shuffle' must be False when using a custom sampler
+    train_loader = DataLoader(dataset, batch_size=batch_size, sampler=sampler, drop_last=True) 
 
-    lr_D = 0.0002
-    lr_G = 0.0001
-    optimizer_discriminator = torch.optim.Adam(discriminator.parameters(), lr=lr_D, betas=(0.5, 0.999))
-    optimizer_generator = torch.optim.Adam(generator.parameters(), lr=lr_G, betas=(0.5, 0.999))
-    loss_function = nn.BCELoss()
-    num_epochs = 300
-    print("\nStarting CTGAN-Lite Training...")
+    # WGAN prefers RMSprop or Adam with no momentum (beta1 = 0.0)
+    lr = 0.0001
+    optimizer_discriminator = torch.optim.Adam(discriminator.parameters(), lr=lr, betas=(0.0, 0.9))
+    optimizer_generator = torch.optim.Adam(generator.parameters(), lr=lr, betas=(0.0, 0.9))
+
+    # ==========================================
+    # Phase 3: WGAN-GP Training Loop
+    # ==========================================
+    num_epochs = 500
+    n_critic = 10 # Train Discriminator 5 times for every 1 Generator update
+    lambda_gp = 10 # Gradient penalty strength
+
+    print("\nStarting WGAN-GP Training...")
     
     for epoch in range(num_epochs):
         for n, (real_samples, conditions) in enumerate(train_loader):
             current_batch_size = real_samples.size(0)
-            packed_batch_size = current_batch_size // pack_size
             
-           # --- Train Discriminator ---
+            # --- 1. Train Discriminator (Critic) ---
             discriminator.zero_grad()
             
-            # --- GPU UPGRADE: Send noise and labels to device ---
+            # INSTANCE NOISE: Blur the real data slightly so the D doesn't memorize it
+            noise_level = max(0.0, 0.1 - (epoch / num_epochs) * 0.1) # Decays over time
+            real_samples_noisy = real_samples + (torch.randn_like(real_samples) * noise_level)
+            
             latent_space_samples = torch.randn(current_batch_size, latent_dim).to(device)
             generated_samples = generator(latent_space_samples, conditions)
             
-            real_labels = (torch.ones(packed_batch_size, 1) * 0.9).to(device)
-            fake_labels = (torch.zeros(packed_batch_size, 1) + 0.1).to(device)
-            # ----------------------------------------------------
+            # WGAN Math: D(real) should be high, D(fake) should be low.
+            real_validity = discriminator(real_samples_noisy, conditions)
+            fake_validity = discriminator(generated_samples.detach(), conditions)
             
-            output_real = discriminator(real_samples, conditions)
-            output_fake = discriminator(generated_samples.detach(), conditions)
+            # Gradient Penalty
+            gradient_penalty = compute_gradient_penalty(discriminator, real_samples.data, generated_samples.data, conditions.data, device)
             
-            loss_real = loss_function(output_real, real_labels)
-            loss_fake = loss_function(output_fake, fake_labels)
-            loss_discriminator = (loss_real + loss_fake) / 2
+            # WGAN Loss = Fake - Real + Penalty
+            loss_discriminator = torch.mean(fake_validity) - torch.mean(real_validity) + lambda_gp * gradient_penalty
+            
             loss_discriminator.backward()
             optimizer_discriminator.step()
 
-            # --- Train Generator ---
-            generator.zero_grad()
-            output_discriminator_generated = discriminator(generated_samples, conditions)
-            loss_generator = loss_function(output_discriminator_generated, real_labels)
-            loss_generator.backward()
-            optimizer_generator.step()
+            # --- 2. Train Generator (Only every n_critic steps) ---
+            if n % n_critic == 0:
+                generator.zero_grad()
+                
+                # We generate new noise for the G update
+                latent_space_samples = torch.randn(current_batch_size, latent_dim).to(device)
+                generated_samples = generator(latent_space_samples, conditions)
+                
+                # G wants D(fake) to be as high as possible
+                fake_validity = discriminator(generated_samples, conditions)
+                loss_generator_base = -torch.mean(fake_validity)
+                
+                # --- THE CORRELATION PENALTY UPGRADE ---
+                # Calculate the correlation matrices
+                real_corr = compute_correlation_matrix(real_samples)
+                fake_corr = compute_correlation_matrix(generated_samples)
+                
+                # Measure the Mean Squared Error (MSE) between the real and fake relationships
+                corr_loss = torch.nn.functional.mse_loss(fake_corr, real_corr)
+                
+                # Add the penalty to the Generator's overall loss (Weighting it by 5.0)
+                lambda_corr = 5.0 
+                loss_generator = loss_generator_base + (lambda_corr * corr_loss)
+                # ---------------------------------------
+                
+                loss_generator.backward()
+                optimizer_generator.step()
 
         if epoch % 10 == 0:
             print(f"Epoch: [{epoch}/{num_epochs}] | Loss D: {loss_discriminator.item():.4f} | Loss G: {loss_generator.item():.4f}")
 
-    print("\nGenerating synthetic data...")
-    num_samples_to_generate = 8000
+    print("\n[UPGRADE] Over-Generating and Cherry-Picking the best PacGAN packs...")
+    OVERGENERATE_MULTIPLIER = 6
+    num_final_samples = 8000
+    total_to_generate = num_final_samples * OVERGENERATE_MULTIPLIER
     
-    synthetic_features, synthetic_conditions = generate_synthetic_samples(
+    # 1. Generate 24,000 patients
+    massive_features, massive_conditions = generate_synthetic_samples(
         generator_model=generator, 
-        num_samples=num_samples_to_generate, 
+        num_samples=total_to_generate, 
         latent_dim=latent_dim, 
-        condition_dim=condition_dim,
+        condition_dim=condition_dim, 
         device=device
     )
 
-    df_synth_features = pd.DataFrame(synthetic_features.cpu().numpy(), columns=feature_cols)
-    df_synth_conditions = pd.DataFrame(synthetic_conditions.cpu().numpy(), columns=condition_cols)
+    # 2. Grade them in packs of 8
+    discriminator.eval()
+    with torch.no_grad():
+        critic_scores = discriminator(massive_features, massive_conditions).squeeze()
+
+    # 3. We have 3,000 packs. We want to keep the best 1,000 packs.
+    num_packs_to_keep = num_final_samples // pack_size
+    _, top_pack_indices = torch.topk(critic_scores, num_packs_to_keep)
+
+    # 4. Reshape the 24,000 patients into their packs [3000 packs, 8 patients, features]
+    features_packed = massive_features.view(-1, pack_size, massive_features.size(-1))
+    conditions_packed = massive_conditions.view(-1, pack_size, massive_conditions.size(-1))
+
+    # 5. Extract our elite 1,000 packs
+    elite_features_packed = features_packed[top_pack_indices]
+    elite_conditions_packed = conditions_packed[top_pack_indices]
+
+    # 6. Flatten them back down into 8,000 individual patients
+    elite_features = elite_features_packed.view(num_final_samples, -1)
+    elite_conditions = elite_conditions_packed.view(num_final_samples, -1)
+
+    print(f"Successfully cherry-picked the top {num_final_samples} patients based on Critic scores!")
+
+    # Push them back into Pandas
+    df_synth_features = pd.DataFrame(elite_features.cpu().numpy(), columns=feature_cols)
+    df_synth_conditions = pd.DataFrame(elite_conditions.cpu().numpy(), columns=condition_cols)
     
+    # RE-INJECT PRUNED COLUMNS
+    for col, default_val in pruned_defaults.items():
+        df_synth_features[col] = default_val
+
     df_synth_encoded = pd.concat([df_synth_features, df_synth_conditions], axis=1)
+    
     all_encoded_cols = original_columns + missing_flags
     df_synth_encoded = df_synth_encoded[all_encoded_cols]
 
@@ -127,129 +242,17 @@ def main():
     final_synthetic_df = postprocess_synthetic_data(
         synthetic_tensor=df_synth_encoded.values,
         original_columns=original_columns,
-        scaler=scaler,
-        date_cols=date_cols,
-        time_cols=time_cols,
-        label_encoders=label_encoders,
-        categorical_cols=categorical_cols,
-        missing_flags=missing_flags
+        scaler=scaler, date_cols=date_cols, time_cols=time_cols,
+        label_encoders=label_encoders, categorical_cols=categorical_cols, missing_flags=missing_flags
     )
 
-    print("Matching original data types for submission validator...")
-
-    force_to_str = {
-        # Stubborn continuous & clinical columns
-        'Preoperative body weight (kg)::20', 'Height (cm)::23', 'Intraoperative blood loss (ml)::69',
-        'Core body temperature at end of operation (°C)::95', 'Morning weight - On postoperative day 1 (kg)::111',
-        'Morning weight - On postoperative day 2 (kg)::113', 
-        'Oral fluids, total volume taken - On day of surgery, postoperatively (ml)::118',
-        'Oral fluids, total volume taken - On postoperative day 1 (ml)::119',
-        'Oral nutritional supplements, energy intake - On day of surgery, postoperatively (kCal)::122',
-        'Oral nutritional supplements, energy intake - On postoperative day 1 (kCal)::123',
-        
-        # VAS and Nausea Holdouts
-        'Patient-reported maximum pain (VAS) - On day of surgery (cm)::158',
-        'Patient-reported maximum pain (VAS) - On postoperative day 1 (cm)::159',
-        'Patient-reported maximum nausea (VAS) - On day of surgery (cm)::162',
-        'Patient-reported maximum nausea (VAS) - On postoperative day 1 (cm)::163',
-        'Patient-reported maximum nausea (VAS) - On postoperative day 2 (cm)::164',
-        'Patient-reported maximum nausea (VAS) - On postoperative day 3 (cm)::165',
-        
-        # Other clinical holdouts
-        'Was iron replacement treatment given?::38',
-        'Termination of smoking (no. of weeks before surgery)::25', 'Standard units per week::41',
-        'Termination of alcohol (no of weeks before surgery)::26', 'Last HbA1c value (Unknown)::28',
-        'Distance from anal verge::1840', 'Level of insertion::89', 
-        'IV volume of crystalloids intraoperatively (ml)::97', 'IV volume of colloids intraoperatively (ml)::99',
-        'IV volume of blood products intra-operatively (ml)::100', 
-        'Intravenous fluids, volume infused - On day of surgery, postoperatively (ml)::106',
-        'Mobilisation - On postoperative day 1::137', 'Strong opioids given within 48 hrs postoperatively::152',
-        'Successful block?::150', 'Use of peripheral opioid receptor antagonist::153',
-        'Grading of most severe complication::186', 'Urinary tract infection::203',
-        'Grading of most severe complication::290', 'Date of last chemotherapy treatment (YYYY-MM-DD)::29',
-        'Termination of epidural analgesia (YYYY-MM-DD)::147', 'Nasogastric tube reinserted date (YYYY-MM-DD)::461',
-        
-        # SURGICAL COLUMNS
-        'Type of anastomosis::67', 'Anastomotic technique::68', 'Length of incision (cm)::64',
-
-        # Complication columns — primary stay
-        'Re-operation(s)::185',
-        'Lobar atelectasis::190', 'Pneumonia::191', 'Pleural Fluid::192', 'Respiratory failure::193',
-        'Pneumothorax::194', 'Other respiratory complication::195', 'Wound Infection::204',
-        'Intraperitoneal or retroperitoneal abscess::202', 'Sepsis::201', 'Septic Shock::200',
-        'Infected graft or prosthesis::199', 'Other infectious complication::198', 'Heart Failure::214',
-        'Acute Myocardial Infarction::213', 'Deep Venous Thrombosis::212', 'Portal Vein Thrombosis::211',
-        'Pulmonary Embolus::210', 'Cerebrovascular lesion::209', 'Cardiac arrhythmia::208',
-        'Cardiac arrest::207', 'Other cardiovascular complication::206', 'Renal dysfunction::228',
-        'Urinary retention::226', 'Hepatic dysfunction::225', 'Pancreatitis::220',
-        'Gastrointestinal haemorrhage::219', 'Nausea or vomiting::218', 'Obstipation or diarrhoea::217',
-        'Other organ dysfunction::216', 'Anastomotic leak::244', 'Urinary tract injury::243',
-        'Mechanical bowel obstruction::241', 'Postoperative paralytic ileus::240', 'Deep wound dehiscence::239',
-        'Intraoperative excessive haemorrhage::237', 'Postoperative excessive haemorrhage::236',
-        'Other surgical technical complication or injury::234', 'Hematoma::233', 'Post dural-puncture headache::249',
-        'Epidural hematoma or abscess::248', 'Other EDA or spinal related complication::247',
-        'Pulmonary aspiration of gastric contents::257', 'Hypotension::256', 'Hypoxia::255',
-        'Prolonged postoperative sedation::251', 'Other anaesthetic complication(s)::253', 'Asthenia or tiredness::260',
-        'Re-operation(s)::286', 
-        
-        # Complication columns — readmission / follow-up
-        'Infectious complication(s)::312',
-        'Respiratory complication(s)::297', 'Lobar atelectasis::300', 'Wound Infection::323',
-        'Urinary tract infection::320', 'Intraperitoneal or retroperitoneal abscess::317', 'Sepsis::319',
-        'Septic Shock::318', 'Infected graft or prosthesis::314', 'Other infectious complication::315',
-        'Cardiovascular complication(s)::282', 'Acute myocardial infarction::288', 'Cardiac arrhythmia::295',
-        'Renal, hepatic, pancreatic and gastrointestinal complication(s)::298', 'Renal dysfunction::299',
-        'Urinary retention::352', 'Hepatic dysfunction::302', 'Pancreatitis::304', 'Gastrointestinal haemorrhage::306',
-        'Nausea or vomiting::310', 'Obstipation or diarrhoea::311', 'Incontinence::313', 'Other organ dysfunction::309',
-        'Surgical complication(s)::325', 'Anastomotic leak::324', 'Urinary tract injury::328',
-        'Mechanical bowel obstruction::322', 'Postoperative paralytic ileus::321', 'Deep wound dehiscence::340',
-        'Intraoperative excessive haemorrhage::339', 'Postoperative excessive haemorrhage::338',
-        'Other surgical technical complication or injury::337', 'Hematoma::336',
-        'Complication(s) related to epidural or spinal anaesthesia::326', 'Anaesthetic complication(s)::331',
-        'Psychiatric complication(s)::343', 'Asthenia or tiredness::344', 'Pain::342', 'Injuries::345', 'Other::347',
-    }
-
-    force_to_float = {
-        'Number of nights receiving intensive care::284', 'Pneumonia::301', 'Pleural Fluid::305',
-        'Respiratory failure::308', 'Pneumothorax::307', 'Other respiratory complication::303',
-        'Heart failure::287', 'Deep venous thrombosis::285', 'Portal Vein Thrombosis::289',
-        'Pulmonary embolus::291', 'Cerebrovascular lesion::294', 'Cardiac arrest::296',
-        'Hypertension::316', 'Other cardiovascular complication::292', 'Post dural-puncture headache::327',
-        'Epidural hematoma or abscess::329', 'Other EDA or spinal related complication::330',
-    }
-
-    for col in final_synthetic_df.columns:
-        orig_type = raw_data[col].dtype
-
-        if col in force_to_float:
-            final_synthetic_df[col] = pd.to_numeric(final_synthetic_df[col], errors='coerce').astype(float)
-
-        elif orig_type == 'object' or orig_type.name == 'category' or col in force_to_str:
-            final_synthetic_df[col] = final_synthetic_df[col].astype(str)
-            final_synthetic_df[col] = final_synthetic_df[col].str.replace(r'\.0$', '', regex=True)
-            final_synthetic_df[col] = final_synthetic_df[col].replace({'nan': '', 'None': ''})
-
-            if not final_synthetic_df[col].str.contains(r'[A-Za-z]').any():
-                final_synthetic_df.iloc[0, final_synthetic_df.columns.get_loc(col)] = 'Unknown'
-
-        elif orig_type == 'int64':
-            final_synthetic_df[col] = pd.to_numeric(final_synthetic_df[col], errors='coerce').round().fillna(0).astype(int)
-
-        elif orig_type == 'float64':
-            final_synthetic_df[col] = pd.to_numeric(final_synthetic_df[col], errors='coerce').astype(float)
-
-    print("Optimizing file size...")
-    float_cols = final_synthetic_df.select_dtypes(include=['float64', 'float32']).columns
-    final_synthetic_df[float_cols] = final_synthetic_df[float_cols].round(2)
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-    output_filename = f"synthetic_data_{timestamp}.csv"
+    # Note: Use your fix_validator.py script to handle the text conversions after this saves!
+    output_filename = f"synthetic_data_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
     output_path = results_dir / output_filename
-    
     final_synthetic_df.to_csv(output_path, index=False)
     
-    print(f"\nExecution successful.")
-    print(f"Synthetic file saved to: {output_path}")
+    print(f"\nExecution successful. Raw file saved to: {output_path}")
+    print("REMINDER: Run 'python fix_validator.py' to format the columns before uploading!")
 
 if __name__ == "__main__":
     main()

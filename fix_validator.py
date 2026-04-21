@@ -1,5 +1,7 @@
 import pandas as pd
 
+from CSVTester import SyntheticDataDiscriminator
+
 def main():
     print("Loading datasets...")
     # 1. Load the original data just to read its inferred datatypes
@@ -7,7 +9,7 @@ def main():
     
     # 2. Load your MOST RECENT synthetic file that failed the validator
     # (Change this filename to whatever your last run generated)
-    synthetic_file_path = "results/synthetic_data_20260421_2052.csv" 
+    synthetic_file_path = "results/synthetic_data_20260421_2223.csv" 
     final_synthetic_df = pd.read_csv(synthetic_file_path)
 
     # 3. Your master override lists
@@ -68,6 +70,17 @@ def main():
         'Other surgical technical complication or injury::337', 'Hematoma::336',
         'Complication(s) related to epidural or spinal anaesthesia::326', 'Anaesthetic complication(s)::331',
         'Psychiatric complication(s)::343', 'Asthenia or tiredness::344', 'Pain::342', 'Injuries::345', 'Other::347',
+        'Preoperative body weight (kg)::20', 
+        'Height (cm)::23', 
+        'Termination of alcohol (no of weeks before surgery)::26', 
+        'IV volume of crystalloids intraoperatively (ml)::97', 
+        'IV volume of colloids intraoperatively (ml)::99', 
+        'IV volume of blood products intra-operatively (ml)::100', 
+        'Oral fluids, total volume taken - On postoperative day 1 (ml)::119', 
+        'Oral nutritional supplements, energy intake - On day of surgery, postoperatively (kCal)::122', 
+        'Oral nutritional supplements, energy intake - On postoperative day 1 (kCal)::123', 
+        'Mobilisation - On postoperative day 1::137', 
+        'Patient-reported maximum nausea (VAS) - On postoperative day 1 (cm)::163',
     }
 
     force_to_float = {
@@ -110,3 +123,9 @@ def main():
 
 if __name__ == "__main__":
     main()
+    original_data_path = "data/data.csv"
+    
+    # We want to test the file that has been perfectly formatted
+    synthetic_data_path = "results/fixed_for_validator.csv" 
+    
+    discriminator = SyntheticDataDiscriminator(original_data_path, synthetic_data_path)
