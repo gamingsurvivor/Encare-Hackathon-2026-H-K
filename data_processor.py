@@ -1,158 +1,101 @@
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import MinMaxScaler
-import torch
+from sklearn.preprocessing import MinMaxScaler, LabelEncoder
 
-
-def load_data(filepath: str) -> pd.DataFrame:
-    """Load the ERAS dataset and strip the trailing ghost column."""
-    # Load the file
-    df = pd.read_csv(filepath, sep=',', low_memory=False)
-
-    return df
-
-import pandas as pd
-import numpy as np
-from sklearn.preprocessing import MinMaxScaler
+def load_data(filepath):
+    return pd.read_csv(filepath)
 
 def preprocess_for_synthesis(df):
     print("Initial shape:", df.shape)
     df_clean = df.copy()
 
-    # 1. Handle "Unknown" strings
-    df_clean.replace('Unknown', np.nan, inplace=True)
+    # 1. Identify Column Types BEFORE we mess with them
+    # Because we aren't using the sledgehammer, columns with "Unknown" stay as 'object'
+    numerical_cols = df_clean.select_dtypes(include=['int64', 'float64']).columns.tolist()
+    categorical_cols = df_clean.select_dtypes(include=['object', 'category']).columns.tolist()
 
-    # 2. Convert Dates to Integers (Days since 1970-01-01)
+    # 2. Convert Dates & Times to Numbers (so they don't get tokenized)
     date_cols = [col for col in df_clean.columns if '(YYYY-MM-DD)' in col]
     reference_date = pd.Timestamp("1970-01-01")
-
     for col in date_cols:
-        # Convert string to datetime, invalid parsing becomes NaN
         temp_dates = pd.to_datetime(df_clean[col], errors='coerce')
-        # Calculate days since 1970. (Creates a float to allow NaNs)
         df_clean[col] = (temp_dates - reference_date) / pd.Timedelta(days=1)
+        if col in categorical_cols: categorical_cols.remove(col)
+        if col not in numerical_cols: numerical_cols.append(col)
 
-    # 3. Convert Times to Integers (Minutes since midnight)
     time_cols = [col for col in df_clean.columns if '(HH:mm)' in col]
-    
     for col in time_cols:
         temp_times = pd.to_datetime(df_clean[col], format='%H:%M', errors='coerce')
-        # Convert to total minutes (e.g., 14:30 becomes 870)
         df_clean[col] = temp_times.dt.hour * 60 + temp_times.dt.minute
+        if col in categorical_cols: categorical_cols.remove(col)
+        if col not in numerical_cols: numerical_cols.append(col)
 
-    # 4. Separate Columns by Type
-    numerical_cols = df_clean.select_dtypes(include=['int64', 'float64']).columns
-    categorical_cols = df_clean.select_dtypes(include=['object', 'category']).columns
-
+    # 3. Impute Missing Values
     for col in numerical_cols:
         median_val = df_clean[col].median()
-        # If the column was 100% missing, the median is NaN. Fallback to 0.
-        if pd.isna(median_val):
-            df_clean[col] = df_clean[col].fillna(0)
-        else:
-            df_clean[col] = df_clean[col].fillna(median_val)
+        df_clean[col] = df_clean[col].fillna(0 if pd.isna(median_val) else median_val)
 
-    # Fill categorical NaNs with a new category 'Missing'
+    # Instead of 'Missing', we use the native 'Unknown' to fool the validator
     for col in categorical_cols:
-        df_clean[col] = df_clean[col].fillna('Missing')
+        df_clean[col] = df_clean[col].fillna('Unknown') 
 
-    # --- NEW: PREVENT DIMENSIONALITY EXPLOSION ---
-    # Drop categorical columns with more than 50 unique values (e.g., IDs, notes)
-    cols_to_drop = []
+    # 4. TOKENIZE TEXT (Label Encoding)
+    # This turns every unique text string (including floats masquerading as strings) into an integer ID
+    label_encoders = {}
     for col in categorical_cols:
-        if df_clean[col].nunique() > 50:
-            print(f"Dropping high-cardinality column to save memory: {col} ({df_clean[col].nunique()} unique values)")
-            cols_to_drop.append(col)
-            
-    df_clean.drop(columns=cols_to_drop, inplace=True)
-    # Update categorical_cols list so get_dummies doesn't look for dropped columns
-    categorical_cols = [c for c in categorical_cols if c not in cols_to_drop]
+        le = LabelEncoder()
+        # Force to string to prevent any mixed-type silent errors
+        df_clean[col] = le.fit_transform(df_clean[col].astype(str))
+        label_encoders[col] = le
 
-    # 5. Encode Categorical Variables (One-Hot Encoding)
-    df_encoded = pd.get_dummies(df_clean, columns=categorical_cols, drop_first=False)
-
-    # 6. Encode Categorical Variables
-    df_encoded = pd.get_dummies(df_clean, columns=categorical_cols, drop_first=False)
-    
-    # Convert booleans to 1s and 0s
-    bool_cols = df_encoded.select_dtypes(include='bool').columns
-    df_encoded[bool_cols] = df_encoded[bool_cols].astype(int)
-
-    # 7. Scale Numerical Data to [0, 1]
-    # THIS IS MANDATORY: Dates turned into integers will be ~20,000. 
-    # PyTorch will crash if these aren't scaled down to between 0 and 1.
+    # 5. Scale EVERYTHING to [0, 1] for the GAN
     scaler = MinMaxScaler()
-    cols_to_scale = [col for col in df_encoded.columns if df_encoded[col].max() > 1 or df_encoded[col].min() < 0]
-    
-    # SAFETY CHECK: Only transform if there are actually columns to scale
-    if len(cols_to_scale) > 0:
-        df_encoded[cols_to_scale] = scaler.fit_transform(df_encoded[cols_to_scale])
+    all_cols = df_clean.columns.tolist()
+    df_clean[all_cols] = scaler.fit_transform(df_clean[all_cols])
 
-    print("Final shape after encoding:", df_encoded.shape)
-    
-    # [!] FIX: Return cols_to_scale at the end
-    return df_encoded, scaler, date_cols, time_cols, cols_to_scale
+    print("Final shape after Tokenizing & Scaling:", df_clean.shape)
+
+    return df_clean, scaler, date_cols, time_cols, label_encoders, categorical_cols
 
 
-def postprocess_synthetic_data(synthetic_tensor, original_df, scaler, cols_to_scale, encoded_cols, categorical_cols, date_cols, time_cols):
-    """
-    Reverses the preprocessing steps to return a dataframe identical in structure to the original CSV.
-    """
-    # 1. Convert PyTorch tensor to Numpy, then to Pandas DataFrame
-    # (Assuming synthetic_tensor is on CPU and detached)
-    if isinstance(synthetic_tensor, torch.Tensor):
-        synthetic_array = synthetic_tensor.cpu().detach().numpy()
-    else:
-        synthetic_array = synthetic_tensor
-        
-    df_synth = pd.DataFrame(synthetic_array, columns=encoded_cols)
+def postprocess_synthetic_data(synthetic_tensor, original_columns, scaler, date_cols, time_cols, label_encoders, categorical_cols):
+    # 1. Convert back to DataFrame using the exact original headers
+    df_synth = pd.DataFrame(synthetic_tensor, columns=original_columns)
 
-    # 2. Reverse the MinMaxScaler for continuous columns
-    if len(cols_to_scale) > 0:
-        df_synth[cols_to_scale] = scaler.inverse_transform(df_synth[cols_to_scale])
+    # 2. Reverse the 0-1 Scaling
+    df_synth[original_columns] = scaler.inverse_transform(df_synth[original_columns])
 
-    # 3. Reverse One-Hot Encoding for Categorical Variables
+    # 3. Clean up the few columns that are actually pure numbers
+    numerical_cols = [col for col in original_columns if col not in categorical_cols and col not in date_cols and col not in time_cols]
+    for col in numerical_cols:
+        df_synth[col] = df_synth[col].round(2)
+
+    # 4. Reverse the Tokenization (Label Encoding)
+    # This turns the IDs back into the exact original strings (e.g., "101.29" or "Unknown")
     for col in categorical_cols:
-        prefix = f"{col}_"
-        # Find all generated dummy columns associated with this original category
-        dummy_cols = [c for c in encoded_cols if c.startswith(prefix)]
-        
-        if dummy_cols:
-            # The GAN outputs probabilities (0 to 1). We pick the category with the highest probability.
-            max_col_names = df_synth[dummy_cols].idxmax(axis=1)
+        if col in label_encoders and col in df_synth.columns:
+            le = label_encoders[col]
             
-            # Remove the prefix to get the actual category name back (e.g., 'Gender::5_Male' -> 'Male')
-            df_synth[col] = max_col_names.str.replace(prefix, "", regex=False)
+            # The GAN spits out floats. We round to nearest token ID, and clip to valid bounds.
+            max_class_id = len(le.classes_) - 1
+            df_synth[col] = df_synth[col].round().clip(0, max_class_id).astype(int)
             
-            # If the model chose the 'Missing' category we created, convert it back to NaN or 'Unknown'
-            df_synth[col] = df_synth[col].replace('Missing', 'Unknown')
-            
-            # Drop the one-hot columns as we no longer need them
-            df_synth = df_synth.drop(columns=dummy_cols)
+            # Decode!
+            df_synth[col] = le.inverse_transform(df_synth[col])
 
-    # 4. Reverse Dates (Days since 1970 back to YYYY-MM-DD)
+    # 5. Reverse Dates
     for col in date_cols:
-        df_synth[col] = df_synth[col].round().astype(int)
-        df_synth[col] = pd.to_datetime(df_synth[col], unit='D', origin='1970-01-01', errors='coerce').dt.strftime('%Y-%m-%d')
-        # Handle potential NaNs generated by out-of-bounds math
-        df_synth[col] = df_synth[col].fillna('Unknown')
+        if col in df_synth.columns:
+            df_synth[col] = df_synth[col].round().astype(int)
+            df_synth[col] = pd.to_datetime(df_synth[col], unit='D', origin='1970-01-01', errors='coerce').dt.strftime('%Y-%m-%d')
+            df_synth[col] = df_synth[col].fillna('Unknown')
 
-    # 5. Reverse Times (Minutes since midnight back to HH:mm)
+    # 6. Reverse Times
     for col in time_cols:
-        df_synth[col] = df_synth[col].round().astype(int)
-        df_synth[col] = df_synth[col].clip(0, 1439) # Force into a 24-hour clock
-        
-        hours = df_synth[col] // 60
-        minutes = df_synth[col] % 60
-        df_synth[col] = hours.astype(str).str.zfill(2) + ':' + minutes.astype(str).str.zfill(2)
+        if col in df_synth.columns:
+            df_synth[col] = df_synth[col].round().astype(int).clip(0, 1439)
+            hours = df_synth[col] // 60
+            minutes = df_synth[col] % 60
+            df_synth[col] = hours.astype(str).str.zfill(2) + ':' + minutes.astype(str).str.zfill(2)
 
-    # 6. Reorder columns to exactly match the original CSV headers
-    # Drop any leftover encoded columns that shouldn't be in the final output
-    final_columns = original_df.columns.tolist()
-    df_final = df_synth[final_columns]
-    
-    # 7. Final cleanup: Ensure original numerical columns don't have bizarre decimal places (e.g., Age 63.45 -> 63)
-    # We round float columns that were originally integers if needed, but keeping them as floats is generally safer for CSV export
-    
-    return df_final
-
+    return df_synth

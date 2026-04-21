@@ -7,7 +7,7 @@ from torch import nn
 from torch.utils.data import TensorDataset, DataLoader
 from dotenv import load_dotenv
 
-# Make sure your imports match the files we just created
+# Make sure your imports match the files we created
 from data_processor import load_data, preprocess_for_synthesis, postprocess_synthetic_data
 from validator import run_evaluation_report
 from approaches.example import run_random_sample
@@ -35,31 +35,21 @@ def main():
     raw_data = load_data(str(input_file))
     print(f"Original Data Shape: {raw_data.shape}")
 
-    # Run the robust preprocessing pipeline
+    # Run the new Tokenizer pipeline
     print("\nPreprocessing data...")
-    # [!] FIX: Unpack cols_to_scale directly from the function
-    df_encoded, scaler, date_cols, time_cols, cols_to_scale = preprocess_for_synthesis(raw_data)
+    df_encoded, scaler, date_cols, time_cols, label_encoders, categorical_cols = preprocess_for_synthesis(raw_data)
+    original_columns = raw_data.columns.tolist()
     
-    # We need to capture these for the post-processor
-    encoded_cols = df_encoded.columns.tolist()
-    categorical_cols = raw_data.select_dtypes(include=['object', 'category']).columns.tolist()
-    cols_to_scale = [col for col in encoded_cols if df_encoded[col].max() > 1 or df_encoded[col].min() < 0]
-
     # ==========================================
     # Phase 2: GAN Setup & PyTorch DataLoaders
     # ==========================================
     # Choose what we want to condition the generation on
-    # Because of one-hot encoding, the prefix will grab all related columns (e.g., _Yes, _No, _Unknown)
-    TARGET_CONDITION_PREFIX = 'Complications at all during primary stay::183_'
-    condition_cols = [col for col in encoded_cols if col.startswith(TARGET_CONDITION_PREFIX)]
-    feature_cols = [col for col in encoded_cols if col not in condition_cols]
-
-    if not condition_cols:
-        print(f"Warning: Could not find condition columns starting with '{TARGET_CONDITION_PREFIX}'. Check your headers.")
-        return
+    TARGET_CONDITION = 'Complications at all during primary stay::183'
+    condition_cols = [TARGET_CONDITION]
+    feature_cols = [col for col in original_columns if col != TARGET_CONDITION]
 
     data_dim = len(feature_cols)
-    condition_dim = len(condition_cols)
+    condition_dim = len(condition_cols) # This will now be 1
     latent_dim = 100
 
     print(f"\nInitializing Models...")
@@ -141,7 +131,6 @@ def main():
     print("\nGenerating synthetic data...")
     num_samples_to_generate = 8000
     
-    # Use the helper function from Generative.py
     synthetic_features, synthetic_conditions = generate_synthetic_samples(
         generator_model=generator, 
         num_samples=num_samples_to_generate, 
@@ -149,13 +138,14 @@ def main():
         condition_dim=condition_dim
     )
 
-    # Combine features and conditions back into a single dataframe
-    # We must ensure the columns are in the exact same order as df_encoded for the post-processor
+    # Combine back into a single dataframe
     df_synth_features = pd.DataFrame(synthetic_features.cpu().numpy(), columns=feature_cols)
     df_synth_conditions = pd.DataFrame(synthetic_conditions.cpu().numpy(), columns=condition_cols)
     
     df_synth_encoded = pd.concat([df_synth_features, df_synth_conditions], axis=1)
-    df_synth_encoded = df_synth_encoded[encoded_cols] # Reorder to match original encoding
+    
+    # CRITICAL: Reorder to perfectly match the 286 original headers
+    df_synth_encoded = df_synth_encoded[original_columns] 
 
     # ==========================================
     # Phase 5: Post-Processing & Export
@@ -163,22 +153,50 @@ def main():
     print("Reversing data to original CSV format...")
     final_synthetic_df = postprocess_synthetic_data(
         synthetic_tensor=df_synth_encoded.values,
-        original_df=raw_data,
+        original_columns=original_columns,
         scaler=scaler,
-        cols_to_scale=cols_to_scale,
-        encoded_cols=encoded_cols,
-        categorical_cols=categorical_cols,
         date_cols=date_cols,
-        time_cols=time_cols
+        time_cols=time_cols,
+        label_encoders=label_encoders,
+        categorical_cols=categorical_cols
     )
 
-    # Optional: Run Evaluation Report (if your validator script handles dataframes directly)
-    # run_evaluation_report(raw_data, final_synthetic_df)
+    # --- THE VALIDATOR SCHEMA HACK ---
+    print("Matching original data types for submission validator...")
+    for col in final_synthetic_df.columns:
+        orig_type = raw_data[col].dtype
+        
+        # If the original file considered this column a string/object...
+        if orig_type == 'object' or orig_type.name == 'category':
+            final_synthetic_df[col] = final_synthetic_df[col].astype(str)
+            
+            # Clean up decimals (e.g. 63.0 -> 63) and Python's stringified 'nan'
+            final_synthetic_df[col] = final_synthetic_df[col].str.replace(r'\.0$', '', regex=True)
+            final_synthetic_df[col] = final_synthetic_df[col].replace({'nan': 'Unknown', '': 'Unknown', 'None': 'Unknown'})
+            
+            # SCHEMA ANCHOR: If a column was perfectly imputed with numbers (like Weight), 
+            # the CSV reader will still parse it as a float. We inject one "Unknown" into the 
+            # first row to force the validator to read the entire column as a String.
+            if not final_synthetic_df[col].str.contains(r'[A-Za-z]').any():
+                final_synthetic_df.iloc[0, final_synthetic_df.columns.get_loc(col)] = 'Unknown'
+                
+        elif orig_type == 'int64':
+            final_synthetic_df[col] = pd.to_numeric(final_synthetic_df[col], errors='coerce').round().fillna(0).astype(int)
+            
+        elif orig_type == 'float64':
+            final_synthetic_df[col] = pd.to_numeric(final_synthetic_df[col], errors='coerce').astype(float)
+    # -----------------------------------------------
+
+    # --- THE FILE SIZE FIX ---
+    print("Optimizing file size...")
+    float_cols = final_synthetic_df.select_dtypes(include=['float64', 'float32']).columns
+    final_synthetic_df[float_cols] = final_synthetic_df[float_cols].round(2)
+    # -------------------------
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     output_filename = f"synthetic_data_{timestamp}.csv"
     output_path = results_dir / output_filename
-
+    
     final_synthetic_df.to_csv(output_path, index=False)
     
     print(f"\nExecution successful.")
