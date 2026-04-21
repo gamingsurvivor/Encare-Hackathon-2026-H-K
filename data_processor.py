@@ -9,11 +9,9 @@ def preprocess_for_synthesis(df):
     print("Initial shape:", df.shape)
     df_clean = df.copy()
 
-    # 1. Identify Column Types
     numerical_cols = df_clean.select_dtypes(include=['int64', 'float64']).columns.tolist()
     categorical_cols = df_clean.select_dtypes(include=['object', 'category']).columns.tolist()
 
-    # 2. Convert Dates & Times to Numbers (so they don't get tokenized)
     date_cols = [col for col in df_clean.columns if '(YYYY-MM-DD)' in col]
     reference_date = pd.Timestamp("1970-01-01")
     for col in date_cols:
@@ -29,91 +27,89 @@ def preprocess_for_synthesis(df):
         if col in categorical_cols: categorical_cols.remove(col)
         if col not in numerical_cols: numerical_cols.append(col)
 
-    # 3. EXPLICIT MISSINGNESS (NO IMPUTATION)
-    # The rubric explicitly states 'Unknown' is a valid answer. We leave it completely alone!
-    
-    # For numerical data, we flag NaNs with an impossible number (-999). 
-    # The GAN will learn to generate -999 when the logic dictates the cell should be empty.
+    # --- THE MASKING FIX FOR NUMERICAL DATA ---
+    missing_flags = []
     for col in numerical_cols:
-        df_clean[col] = df_clean[col].fillna(-999)
+        if df_clean[col].isna().any():
+            # 1. Create a binary mask (1 = hidden/missing, 0 = has value)
+            flag_col = f"{col}_missing_flag"
+            df_clean[flag_col] = df_clean[col].isna().astype(float)
+            missing_flags.append(flag_col)
+            
+            # 2. Temporarily fill with median to fix the scaling distortion
+            median_val = df_clean[col].median()
+            df_clean[col] = df_clean[col].fillna(0 if pd.isna(median_val) else median_val)
 
-    # For text data, we flag NaNs with a specific token string.
+    # Categorical Missingness (Leave as explicit token)
     for col in categorical_cols:
-        df_clean[col] = df_clean[col].fillna('<BLANK>') 
+        df_clean[col] = df_clean[col].fillna('<BLANK>')
 
-    # 4. TOKENIZE TEXT (Label Encoding)
     label_encoders = {}
     for col in categorical_cols:
         le = LabelEncoder()
         df_clean[col] = le.fit_transform(df_clean[col].astype(str))
         label_encoders[col] = le
 
-    # 5. Scale EVERYTHING to [0, 1] for the GAN
+    # Scale EVERYTHING (Including our new flags)
     scaler = MinMaxScaler()
     all_cols = df_clean.columns.tolist()
     df_clean[all_cols] = scaler.fit_transform(df_clean[all_cols])
 
-    print("Final shape after Tokenizing & Scaling:", df_clean.shape)
+    print("Final shape after Masking & Scaling:", df_clean.shape)
 
-    return df_clean, scaler, date_cols, time_cols, label_encoders, categorical_cols
+    return df_clean, scaler, date_cols, time_cols, label_encoders, categorical_cols, missing_flags
 
 
-def postprocess_synthetic_data(synthetic_tensor, original_columns, scaler, date_cols, time_cols, label_encoders, categorical_cols):
-    df_synth = pd.DataFrame(synthetic_tensor, columns=original_columns)
+def postprocess_synthetic_data(synthetic_tensor, original_columns, scaler, date_cols, time_cols, label_encoders, categorical_cols, missing_flags):
+    # Rebuild dataframe with the extra flag columns
+    all_cols = original_columns + missing_flags
+    df_synth = pd.DataFrame(synthetic_tensor, columns=all_cols)
 
     # 1. Reverse the 0-1 Scaling
-    df_synth[original_columns] = scaler.inverse_transform(df_synth[original_columns])
+    df_synth[all_cols] = scaler.inverse_transform(df_synth[all_cols])
 
-    # 2. Reverse Pure Numerical Columns & Restore Missing Values
+    # 2. ENFORCE THE RUBRIC: Restore structural missingness perfectly
+    for flag_col in missing_flags:
+        orig_col = flag_col.replace("_missing_flag", "")
+        
+        # If the GAN learned the flag > 0.5, the logic dictates this cell should be blank
+        df_synth.loc[df_synth[flag_col] > 0.5, orig_col] = np.nan
+        
+    # Drop the temporary flags so they don't export to the CSV
+    df_synth = df_synth[original_columns]
+
+    # Clean up numerical formatting
     numerical_cols = [col for col in original_columns if col not in categorical_cols and col not in date_cols and col not in time_cols]
     for col in numerical_cols:
-        # If the GAN generated a number anywhere near our -999 flag, it means "This should be empty"
-        df_synth.loc[df_synth[col] < -500, col] = np.nan
         df_synth[col] = df_synth[col].round(2)
 
-    # 3. Reverse Tokenization & Restore Missing Values
+    # 3. Reverse Tokenization
     for col in categorical_cols:
         if col in label_encoders and col in df_synth.columns:
             le = label_encoders[col]
-            
             max_class_id = len(le.classes_) - 1
             df_synth[col] = df_synth[col].round().clip(0, max_class_id).astype(int)
             
-            # Decode back to exact text
             df_synth[col] = le.inverse_transform(df_synth[col])
-            
-            # Turn our explicit structural flag back into a true empty cell
+            # Restore true blanks
             df_synth[col] = df_synth[col].replace('<BLANK>', np.nan)
 
     # 4. Reverse Dates
     for col in date_cols:
         if col in df_synth.columns:
-            # Reverse the flag for dates
-            df_synth.loc[df_synth[col] < -500, col] = np.nan
-            
             valid_mask = df_synth[col].notna()
-            
-            # THE FIX: Cast the column to object so Pandas allows us to insert strings
             df_synth[col] = df_synth[col].astype(object)
-            
-            # We only format the valid dates, leaving NaNs alone
             dates = pd.to_datetime(df_synth.loc[valid_mask, col].round().astype(int), unit='D', origin='1970-01-01', errors='coerce').dt.strftime('%Y-%m-%d')
             df_synth.loc[valid_mask, col] = dates
 
     # 5. Reverse Times
     for col in time_cols:
         if col in df_synth.columns:
-            df_synth.loc[df_synth[col] < -500, col] = np.nan
-            
             valid_mask = df_synth[col].notna()
-            
-            # THE FIX: Cast the column to object so Pandas allows us to insert strings
             df_synth[col] = df_synth[col].astype(object)
-            
             valid_times = df_synth.loc[valid_mask, col].round().astype(int).clip(0, 1439)
             hours = valid_times // 60
             minutes = valid_times % 60
-            
             df_synth.loc[valid_mask, col] = hours.astype(str).str.zfill(2) + ':' + minutes.astype(str).str.zfill(2)
 
     return df_synth

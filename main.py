@@ -37,7 +37,7 @@ def main():
 
     # Run the new Tokenizer pipeline
     print("\nPreprocessing data...")
-    df_encoded, scaler, date_cols, time_cols, label_encoders, categorical_cols = preprocess_for_synthesis(raw_data)
+    df_encoded, scaler, date_cols, time_cols, label_encoders, categorical_cols, missing_flags = preprocess_for_synthesis(raw_data)
     original_columns = raw_data.columns.tolist()
     
     # ==========================================
@@ -152,7 +152,8 @@ def main():
         date_cols=date_cols,
         time_cols=time_cols,
         label_encoders=label_encoders,
-        categorical_cols=categorical_cols
+        categorical_cols=categorical_cols,
+        missing_flags=missing_flags # Add this variable here!
     )
 
     # --- TYPE COERCION ---
