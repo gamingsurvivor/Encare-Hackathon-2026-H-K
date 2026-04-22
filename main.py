@@ -97,7 +97,7 @@ def main():
     optimizer_generator = torch.optim.Adam(generator.parameters(), lr=lr, betas=(0.0, 0.9))
 
     # --- Phase 3: WGAN-GP Training Loop ---
-    num_epochs = 1000
+    num_epochs = 300
     n_critic = 5 
     lambda_gp = 10 
     
@@ -126,16 +126,25 @@ def main():
                 latent_space_samples = torch.randn(current_batch_size, latent_dim).to(device)
                 generated_samples = generator(latent_space_samples, conditions)
                 
+                # 1. Base WGAN Loss
                 fake_validity = discriminator(generated_samples, conditions)
                 loss_generator_base = -torch.mean(fake_validity)
                 
-                # Correlation Penalty Only (No Feature Matching to prevent mode collapse)
+                # 2. Correlation Overdrive (Preserves 2D Relationships)
                 real_corr = compute_correlation_matrix(real_samples)
                 fake_corr = compute_correlation_matrix(generated_samples)
                 corr_loss = torch.nn.functional.mse_loss(fake_corr, real_corr)
                 
-                lambda_corr = 1.0 
-                loss_generator = loss_generator_base + (lambda_corr * corr_loss)
+                # 3. Statistical Feature Matching (Prevents Mode Collapse & Fixes 1D Shapes)
+                # This mathematically forces the GAN to match the exact center and spread of the real data
+                mean_loss = torch.nn.functional.mse_loss(generated_samples.mean(dim=0), real_samples.mean(dim=0))
+                std_loss = torch.nn.functional.mse_loss(generated_samples.std(dim=0) + 1e-8, real_samples.std(dim=0) + 1e-8)
+                
+                # Balance the constraints
+                lambda_corr = 5.0 
+                lambda_fm = 10.0 
+                
+                loss_generator = loss_generator_base + (lambda_corr * corr_loss) + (lambda_fm * (mean_loss + std_loss))
                 
                 loss_generator.backward()
                 optimizer_generator.step()
@@ -182,7 +191,6 @@ def main():
     df_synth_encoded = df_synth_encoded[all_encoded_cols]
 
     print("Reversing data to original CSV format...")
-    # NOTE: raw_data IS PASSED HERE
     final_synthetic_df = postprocess_synthetic_data(
         synthetic_tensor=df_synth_encoded.values,
         original_columns=original_columns,

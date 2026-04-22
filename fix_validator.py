@@ -1,5 +1,7 @@
 import pandas as pd
 import numpy as np
+import glob
+import os
 
 def main():
     print("Loading datasets for Fully Autonomous Alignment...")
@@ -7,8 +9,6 @@ def main():
     raw_data = pd.read_csv("data/data.csv", low_memory=False)
     
     # Locate the most recent file in the results folder automatically
-    import glob
-    import os
     list_of_files = glob.glob('results/synthetic_data_*.csv')
     if not list_of_files:
         print("Could not find a generated CSV in results/ folder!")

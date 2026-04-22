@@ -51,15 +51,11 @@ def preprocess_for_synthesis(df):
         df_clean[col] = le.fit_transform(df_clean[col].astype(str))
         label_encoders[col] = le
 
-    # ==========================================
-    # PROPERLY SPLIT CONTINUOUS & DISCRETE
-    # ==========================================
+    # --- Split Continuous vs Discrete ---
     discrete_cols = categorical_cols + missing_flags + [c for c in numerical_cols if df_clean[c].nunique() <= 10]
-    discrete_cols = list(set(discrete_cols)) # Remove duplicates
-    
+    discrete_cols = list(set(discrete_cols))
     continuous_cols = [c for c in df_clean.columns if c not in discrete_cols]
 
-    # Normal distribution for stable GAN training
     qt_scaler = QuantileTransformer(output_distribution='normal', random_state=42)
     if continuous_cols:
         df_clean[continuous_cols] = qt_scaler.fit_transform(df_clean[continuous_cols].fillna(0))
@@ -78,93 +74,61 @@ def preprocess_for_synthesis(df):
     print(f"Scaling complete. {len(discrete_cols)} discrete, {len(continuous_cols)} continuous.")
     return df_clean, scaler_bundle, date_cols, time_cols, label_encoders, categorical_cols, missing_flags
 
-def apply_business_rules(df):
-    print("Enforcing Medical & Mathematical Invariants to defeat Discriminator...")
-    
-    # 1. THE MATH TELL: Calculate BMI perfectly
-    if 'Preoperative body weight (kg)::20' in df.columns and 'Height (cm)::23' in df.columns and 'BMI::24' in df.columns:
-        weight = pd.to_numeric(df['Preoperative body weight (kg)::20'], errors='coerce')
-        height_m = pd.to_numeric(df['Height (cm)::23'], errors='coerce') / 100.0
-        df['BMI::24'] = (weight / (height_m ** 2)).round(2)
-
-    # 2. THE MEDICAL TELL: Complication Logic
-    target_comp = 'Complications at all during primary stay::183'
-    if target_comp in df.columns:
-        no_comp_mask = df[target_comp] == 'No'
-        
-        if 'Grading of most severe complication::186' in df.columns:
-            df.loc[no_comp_mask, 'Grading of most severe complication::186'] = np.nan
-            
-        comp_categories = [
-            'Respiratory complication(s)::189', 'Infectious complication(s)::197', 
-            'Cardiovascular complication(s)::205', 'Surgical complication(s)::230',
-            'Anaesthetic complication(s)::250', 'Psychiatric complication(s)::258'
-        ]
-        for c in comp_categories:
-            if c in df.columns:
-                df.loc[no_comp_mask, c] = 'No'
-
-    # 3. TOTAL LENGTH OF STAY: Math alignment
-    los_primary = 'Length of stay (nights in hospital after primary operation)::179'
-    los_readm = 'Length of stay for readmissions::354'
-    los_total = 'Total length of stay (nights)::353'
-    
-    if los_primary in df.columns and los_readm in df.columns and los_total in df.columns:
-        p_stay = pd.to_numeric(df[los_primary], errors='coerce').fillna(0)
-        r_stay = pd.to_numeric(df[los_readm], errors='coerce').fillna(0)
-        df[los_total] = (p_stay + r_stay).round().astype(int)
-
-    # 4. READMISSION LOGIC:
-    if 'Readmission(s)::280' in df.columns and los_readm in df.columns:
-        no_readm_mask = df['Readmission(s)::280'] == 'No'
-        df.loc[no_readm_mask, los_readm] = 0
-
-    return df
-
-
 def postprocess_synthetic_data(synthetic_tensor, original_columns, scaler_bundle, date_cols, time_cols, label_encoders, categorical_cols, missing_flags, raw_df):
     all_cols = original_columns + missing_flags
     df_synth = pd.DataFrame(synthetic_tensor, columns=all_cols)
 
-    # 1. Reverse Scalers just enough to establish accurate ranking
+    print("Reversing scales (Honest GAN Output)...")
+    
+    # 1. Reverse Continuous (Trust the GAN's distributions natively)
     if scaler_bundle['continuous_cols']:
         df_synth[scaler_bundle['continuous_cols']] = scaler_bundle['qt'].inverse_transform(df_synth[scaler_bundle['continuous_cols']])
+
+    # 2. Reverse Discrete (Clip to boundaries, round safely)
     if scaler_bundle['discrete_cols']:
+        df_synth[scaler_bundle['discrete_cols']] = df_synth[scaler_bundle['discrete_cols']].clip(0, 1)
         df_synth[scaler_bundle['discrete_cols']] = scaler_bundle['mm'].inverse_transform(df_synth[scaler_bundle['discrete_cols']])
+        df_synth[scaler_bundle['discrete_cols']] = df_synth[scaler_bundle['discrete_cols']].round()
 
-    # ==========================================
-    # 2. UNIVERSAL EXACT MAPPING (The Categorical & Continuous Fix)
-    # ==========================================
-    print("Applying Universal Distribution Alignment to perfectly match all histograms...")
-    # We skip columns that we mathematically calculate later
-    calculated_cols = ['BMI::24', 'Total length of stay (nights)::353']
-    
-    for col in original_columns:
-        if col in raw_df.columns and col not in calculated_cols:
-            real_values = raw_df[col].dropna().values
-            if len(real_values) > 0:
-                # np.sort automatically alphabetizes strings and chronological-izes dates!
-                real_sorted = np.sort(real_values)
-                # Rank the GAN's guesses from 0.0 to 1.0
-                gan_ranks = df_synth[col].rank(pct=True, method='first').values
-                # Snap the GAN's rank to the exact real-world value at that percentile
-                indices = np.clip(np.round(gan_ranks * (len(real_sorted) - 1)).astype(int), 0, len(real_sorted) - 1)
-                df_synth[col] = real_sorted[indices]
-
-    # ==========================================
-    # 3. RESTORE STRUCTURAL MISSINGNESS (NaNs)
-    # ==========================================
+    # 3. Restore Missingness (NaNs)
     for flag_col in missing_flags:
         orig_col = flag_col.replace("_missing_flag", "")
         if orig_col in df_synth.columns:
-            # If the GAN predicted missingness, punch a NaN hole into the mapped data
             df_synth.loc[df_synth[flag_col] > 0.5, orig_col] = np.nan
             
     df_synth = df_synth[original_columns]
 
-    # ==========================================
-    # 4. ENFORCE INVARIANTS TO BEAT DISCRIMINATION
-    # ==========================================
-    df_synth = apply_business_rules(df_synth)
+    # 4. Standard Formatting (Decode labels and Dates)
+    numerical_cols = [col for col in original_columns if col not in categorical_cols and col not in date_cols and col not in time_cols]
+    for col in numerical_cols:
+        # REMOVED .round(2) HERE - Let the GAN's native floating point precision match the real data!
+        df_synth[col] = pd.to_numeric(df_synth[col], errors='coerce')
+
+    for col in categorical_cols:
+        if col in label_encoders and col in df_synth.columns:
+            le = label_encoders[col]
+            max_class_id = len(le.classes_) - 1
+            class_ids = df_synth[col].fillna(0).round().clip(0, max_class_id).astype(int)
+            df_synth[col] = le.inverse_transform(class_ids)
+            df_synth[col] = df_synth[col].replace('<BLANK>', np.nan)
+
+    for col in date_cols:
+        if col in df_synth.columns:
+            valid_mask = df_synth[col].notna()
+            temp_numeric = pd.to_numeric(df_synth.loc[valid_mask, col], errors='coerce')
+            valid_ints = temp_numeric.round().fillna(0).astype(int)
+            dates = pd.to_datetime(valid_ints, unit='D', origin='1970-01-01', errors='coerce').dt.strftime('%Y-%m-%d')
+            df_synth[col] = df_synth[col].astype(object)
+            df_synth.loc[valid_mask, col] = dates
+
+    for col in time_cols:
+        if col in df_synth.columns:
+            valid_mask = df_synth[col].notna()
+            temp_numeric = pd.to_numeric(df_synth.loc[valid_mask, col], errors='coerce')
+            valid_times = temp_numeric.round().fillna(0).astype(int).clip(0, 1439)
+            hours = valid_times // 60
+            minutes = valid_times % 60
+            df_synth[col] = df_synth[col].astype(object)
+            df_synth.loc[valid_mask, col] = hours.astype(str).str.zfill(2) + ':' + minutes.astype(str).str.zfill(2)
 
     return df_synth
