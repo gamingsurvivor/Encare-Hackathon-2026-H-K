@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import QuantileTransformer, LabelEncoder
+from sklearn.preprocessing import QuantileTransformer, LabelEncoder, MinMaxScaler
 
 def load_data(filepath):
     return pd.read_csv(filepath, low_memory=False)
@@ -12,6 +12,7 @@ def preprocess_for_synthesis(df):
     numerical_cols = df_clean.select_dtypes(include=['int64', 'float64']).columns.tolist()
     categorical_cols = df_clean.select_dtypes(include=['object', 'category']).columns.tolist()
 
+    # --- Convert Dates & Times ---
     date_cols = [col for col in df_clean.columns if '(YYYY-MM-DD)' in col]
     reference_date = pd.Timestamp("1970-01-01")
     for col in date_cols:
@@ -27,92 +28,143 @@ def preprocess_for_synthesis(df):
         if col in categorical_cols: categorical_cols.remove(col)
         if col not in numerical_cols: numerical_cols.append(col)
 
-    # --- THE MASKING FIX FOR NUMERICAL DATA ---
-    # --- THE MASKING FIX FOR NUMERICAL DATA ---
+    # --- Extract Missing Flags ---
     missing_flags = []
-    new_flag_cols = {} # Dictionary to hold our new columns temporarily
-    
+    new_flag_cols = {}
     for col in numerical_cols:
         if df_clean[col].isna().any():
             flag_col = f"{col}_missing_flag"
-            
-            # Store the mask in our dictionary instead of attaching it immediately
             new_flag_cols[flag_col] = df_clean[col].isna().astype(float)
             missing_flags.append(flag_col)
-            
-            # Temporarily fill with median to fix the scaling math
             median_val = df_clean[col].median()
             df_clean[col] = df_clean[col].fillna(0 if pd.isna(median_val) else median_val)
 
-    # Attach all new columns at exactly the same time to prevent fragmentation
     if new_flag_cols:
         flags_df = pd.DataFrame(new_flag_cols)
         df_clean = pd.concat([df_clean, flags_df], axis=1)
 
-    # Categorical Missingness
-    for col in categorical_cols:
-        df_clean[col] = df_clean[col].fillna('<BLANK>')
-
+    # --- Encode Categoricals ---
     label_encoders = {}
     for col in categorical_cols:
+        df_clean[col] = df_clean[col].fillna('<BLANK>')
         le = LabelEncoder()
         df_clean[col] = le.fit_transform(df_clean[col].astype(str))
         label_encoders[col] = le
 
-    # --- CTGAN DISTRIBUTION FIX ---
-    # output_distribution='normal' forces perfect bell curves
-    scaler = QuantileTransformer(output_distribution='normal', random_state=42)
-    all_cols = df_clean.columns.tolist()
+    # ==========================================
+    # PROPERLY SPLIT CONTINUOUS & DISCRETE
+    # ==========================================
+    discrete_cols = categorical_cols + missing_flags + [c for c in numerical_cols if df_clean[c].nunique() <= 10]
+    discrete_cols = list(set(discrete_cols)) # Remove duplicates
     
-    df_clean[all_cols] = df_clean[all_cols].fillna(0)
-    df_clean[all_cols] = scaler.fit_transform(df_clean[all_cols])
+    continuous_cols = [c for c in df_clean.columns if c not in discrete_cols]
 
-    print("Final shape after Masking & Scaling:", df_clean.shape)
+    # Normal distribution for stable GAN training
+    qt_scaler = QuantileTransformer(output_distribution='normal', random_state=42)
+    if continuous_cols:
+        df_clean[continuous_cols] = qt_scaler.fit_transform(df_clean[continuous_cols].fillna(0))
 
-    return df_clean, scaler, date_cols, time_cols, label_encoders, categorical_cols, missing_flags
+    mm_scaler = MinMaxScaler()
+    if discrete_cols:
+        df_clean[discrete_cols] = mm_scaler.fit_transform(df_clean[discrete_cols].fillna(0))
+
+    scaler_bundle = {
+        'qt': qt_scaler, 
+        'mm': mm_scaler, 
+        'continuous_cols': continuous_cols, 
+        'discrete_cols': discrete_cols
+    }
+    
+    print(f"Scaling complete. {len(discrete_cols)} discrete, {len(continuous_cols)} continuous.")
+    return df_clean, scaler_bundle, date_cols, time_cols, label_encoders, categorical_cols, missing_flags
+
+def apply_business_rules(df):
+    print("Enforcing Medical & Mathematical Invariants to defeat Discriminator...")
+    
+    # 1. THE MATH TELL: Calculate BMI perfectly
+    if 'Preoperative body weight (kg)::20' in df.columns and 'Height (cm)::23' in df.columns and 'BMI::24' in df.columns:
+        weight = pd.to_numeric(df['Preoperative body weight (kg)::20'], errors='coerce')
+        height_m = pd.to_numeric(df['Height (cm)::23'], errors='coerce') / 100.0
+        df['BMI::24'] = (weight / (height_m ** 2)).round(2)
+
+    # 2. THE MEDICAL TELL: Complication Logic
+    target_comp = 'Complications at all during primary stay::183'
+    if target_comp in df.columns:
+        no_comp_mask = df[target_comp] == 'No'
+        
+        if 'Grading of most severe complication::186' in df.columns:
+            df.loc[no_comp_mask, 'Grading of most severe complication::186'] = np.nan
+            
+        comp_categories = [
+            'Respiratory complication(s)::189', 'Infectious complication(s)::197', 
+            'Cardiovascular complication(s)::205', 'Surgical complication(s)::230',
+            'Anaesthetic complication(s)::250', 'Psychiatric complication(s)::258'
+        ]
+        for c in comp_categories:
+            if c in df.columns:
+                df.loc[no_comp_mask, c] = 'No'
+
+    # 3. TOTAL LENGTH OF STAY: Math alignment
+    los_primary = 'Length of stay (nights in hospital after primary operation)::179'
+    los_readm = 'Length of stay for readmissions::354'
+    los_total = 'Total length of stay (nights)::353'
+    
+    if los_primary in df.columns and los_readm in df.columns and los_total in df.columns:
+        p_stay = pd.to_numeric(df[los_primary], errors='coerce').fillna(0)
+        r_stay = pd.to_numeric(df[los_readm], errors='coerce').fillna(0)
+        df[los_total] = (p_stay + r_stay).round().astype(int)
+
+    # 4. READMISSION LOGIC:
+    if 'Readmission(s)::280' in df.columns and los_readm in df.columns:
+        no_readm_mask = df['Readmission(s)::280'] == 'No'
+        df.loc[no_readm_mask, los_readm] = 0
+
+    return df
 
 
-def postprocess_synthetic_data(synthetic_tensor, original_columns, scaler, date_cols, time_cols, label_encoders, categorical_cols, missing_flags):
+def postprocess_synthetic_data(synthetic_tensor, original_columns, scaler_bundle, date_cols, time_cols, label_encoders, categorical_cols, missing_flags, raw_df):
     all_cols = original_columns + missing_flags
     df_synth = pd.DataFrame(synthetic_tensor, columns=all_cols)
 
-    df_synth[all_cols] = scaler.inverse_transform(df_synth[all_cols])
+    # 1. Reverse Scalers just enough to establish accurate ranking
+    if scaler_bundle['continuous_cols']:
+        df_synth[scaler_bundle['continuous_cols']] = scaler_bundle['qt'].inverse_transform(df_synth[scaler_bundle['continuous_cols']])
+    if scaler_bundle['discrete_cols']:
+        df_synth[scaler_bundle['discrete_cols']] = scaler_bundle['mm'].inverse_transform(df_synth[scaler_bundle['discrete_cols']])
 
-    # ENFORCE THE RUBRIC: Restore structural missingness
+    # ==========================================
+    # 2. UNIVERSAL EXACT MAPPING (The Categorical & Continuous Fix)
+    # ==========================================
+    print("Applying Universal Distribution Alignment to perfectly match all histograms...")
+    # We skip columns that we mathematically calculate later
+    calculated_cols = ['BMI::24', 'Total length of stay (nights)::353']
+    
+    for col in original_columns:
+        if col in raw_df.columns and col not in calculated_cols:
+            real_values = raw_df[col].dropna().values
+            if len(real_values) > 0:
+                # np.sort automatically alphabetizes strings and chronological-izes dates!
+                real_sorted = np.sort(real_values)
+                # Rank the GAN's guesses from 0.0 to 1.0
+                gan_ranks = df_synth[col].rank(pct=True, method='first').values
+                # Snap the GAN's rank to the exact real-world value at that percentile
+                indices = np.clip(np.round(gan_ranks * (len(real_sorted) - 1)).astype(int), 0, len(real_sorted) - 1)
+                df_synth[col] = real_sorted[indices]
+
+    # ==========================================
+    # 3. RESTORE STRUCTURAL MISSINGNESS (NaNs)
+    # ==========================================
     for flag_col in missing_flags:
         orig_col = flag_col.replace("_missing_flag", "")
-        # If GAN outputs > 0.5 for the flag, the column logic says it should be blank
-        df_synth.loc[df_synth[flag_col] > 0.5, orig_col] = np.nan
-        
+        if orig_col in df_synth.columns:
+            # If the GAN predicted missingness, punch a NaN hole into the mapped data
+            df_synth.loc[df_synth[flag_col] > 0.5, orig_col] = np.nan
+            
     df_synth = df_synth[original_columns]
 
-    numerical_cols = [col for col in original_columns if col not in categorical_cols and col not in date_cols and col not in time_cols]
-    for col in numerical_cols:
-        df_synth[col] = df_synth[col].round(2)
-
-    for col in categorical_cols:
-        if col in label_encoders and col in df_synth.columns:
-            le = label_encoders[col]
-            max_class_id = len(le.classes_) - 1
-            df_synth[col] = df_synth[col].round().clip(0, max_class_id).astype(int)
-            
-            df_synth[col] = le.inverse_transform(df_synth[col])
-            df_synth[col] = df_synth[col].replace('<BLANK>', np.nan)
-
-    for col in date_cols:
-        if col in df_synth.columns:
-            valid_mask = df_synth[col].notna()
-            df_synth[col] = df_synth[col].astype(object)
-            dates = pd.to_datetime(df_synth.loc[valid_mask, col].round().astype(int), unit='D', origin='1970-01-01', errors='coerce').dt.strftime('%Y-%m-%d')
-            df_synth.loc[valid_mask, col] = dates
-
-    for col in time_cols:
-        if col in df_synth.columns:
-            valid_mask = df_synth[col].notna()
-            df_synth[col] = df_synth[col].astype(object)
-            valid_times = df_synth.loc[valid_mask, col].round().astype(int).clip(0, 1439)
-            hours = valid_times // 60
-            minutes = valid_times % 60
-            df_synth.loc[valid_mask, col] = hours.astype(str).str.zfill(2) + ':' + minutes.astype(str).str.zfill(2)
+    # ==========================================
+    # 4. ENFORCE INVARIANTS TO BEAT DISCRIMINATION
+    # ==========================================
+    df_synth = apply_business_rules(df_synth)
 
     return df_synth

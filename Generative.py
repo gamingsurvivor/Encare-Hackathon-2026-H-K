@@ -30,7 +30,7 @@ def generate_synthetic_samples(generator_model, num_samples, latent_dim, conditi
     generator_model.eval()
     
     with torch.no_grad():
-        latent_space_samples = torch.randn(num_samples, latent_dim).to(device)
+        latent_space_samples = torch.randn(num_samples, latent_dim, device=device)
         
         # Binary condition (e.g., Complications Yes/No)
         random_conditions = torch.randint(0, 2, (num_samples, condition_dim)).float().to(device)
