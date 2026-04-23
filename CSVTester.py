@@ -127,8 +127,8 @@ class SyntheticDataDiscriminator:
         preds = clf.predict_proba(X_test)[:, 1]
         auc = roc_auc_score(y_test, preds)
 
-       # ==========================================
-        # DETECTIVE MODE (Uncapped)
+        # ==========================================
+        # DETECTIVE MODE (Show ALL Active Splitters)
         # ==========================================
         if auc > 0.80:
             from sklearn.inspection import permutation_importance
@@ -136,13 +136,19 @@ class SyntheticDataDiscriminator:
             result = permutation_importance(clf, X_test, y_test, n_repeats=5, random_state=42)
             importances = result.importances_mean
             
-            # Grab the top 15 most important features
-            top_indices = importances.argsort()[-15:][::-1]
+            # Sort all indices
+            top_indices = importances.argsort()[::-1]
             
-            print("\n>>> THE TOP 15 ML SPLITTERS <<<")
-            print("These are the columns the AI is using to separate Real vs Fake:")
+            print("\n>>> ALL ACTIVE ML SPLITTERS <<<")
+            print("These are all the columns the AI is using to cheat (Importance > 0.0001):")
+            found_any = False
             for idx in top_indices:
-                print(f" -> {X.columns[idx]}: {importances[idx]:.6f} importance")
+                if importances[idx] > 0.0001:
+                    print(f" -> {X.columns[idx]}: {importances[idx]:.6f} importance")
+                    found_any = True
+            
+            if not found_any:
+                print(" -> No single column stands out. It is using distributed guessing.")
             print("-----------------------------\n")
 
         discrimination_score = 1.0 - (2 * abs(auc - 0.5))
