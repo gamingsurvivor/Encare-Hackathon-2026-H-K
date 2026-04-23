@@ -70,7 +70,7 @@ def main():
     data_dim = len(feature_cols)
     latent_dim = 256
     batch_size = 256
-    num_epochs = 1000
+    num_epochs = 300
     n_critic = 5
     lambda_gp = 5
     lr = 0.00005

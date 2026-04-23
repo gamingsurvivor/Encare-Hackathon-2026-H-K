@@ -12,7 +12,7 @@ def visualize_distributions():
     print("Loading datasets...")
     # Update these paths to match your local setup
     orig_path = 'data/data.csv'
-    synth_path = 'results/official_submission_clean6.csv'
+    synth_path = 'results/final_submission_scrubbed.csv'
     
     try:
         df_orig = pd.read_csv(orig_path, low_memory=False)

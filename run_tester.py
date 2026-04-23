@@ -13,7 +13,7 @@ def main():
     original_data_path = "data/data.csv"
     
     # 2. Point to the perfectly formatted synthetic data
-    synthetic_data_path = "results/final_submission_scrubbed.csv" 
+    synthetic_data_path = "results/FINAL_PORTAL_SUBMISSION.csv" 
     
     print(f"Comparing:")
     print(f"  Real Data: {original_data_path}")

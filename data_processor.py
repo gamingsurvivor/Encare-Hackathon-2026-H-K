@@ -176,18 +176,22 @@ def preprocess_for_synthesis(df):
     missing_flags = []
     new_flag_cols = {}
     
-    # FIX: Check ALL columns for missingness, not just numerical ones!
     for col in numerical_cols + categorical_cols:
         if df_clean[col].isna().any():
             flag_col = f"{col}_missing_flag"
             new_flag_cols[flag_col] = df_clean[col].isna().astype(float)
             missing_flags.append(flag_col)
             
-            # If it's numerical, apply the Mean-fill to prevent zero-spikes
             if col in numerical_cols:
-                mean_val = df_clean[col].mean()
-                df_clean[col] = df_clean[col].fillna(0 if pd.isna(mean_val) else mean_val)
-            # (Categoricals are safely handled by the '<BLANK>' fill below this loop)
+                # FIX 5: Random Sample Fill (Destroys Mode Collapse!)
+                valid_values = df_clean[col].dropna()
+                if not valid_values.empty:
+                    # Pick random real values to fill the holes
+                    num_missing = df_clean[col].isna().sum()
+                    sampled_fills = valid_values.sample(num_missing, replace=True).values
+                    df_clean.loc[df_clean[col].isna(), col] = sampled_fills
+                else:
+                    df_clean[col] = df_clean[col].fillna(0)
 
     if new_flag_cols:
         flags_df = pd.DataFrame(new_flag_cols)
@@ -301,6 +305,14 @@ def enforce_date_ordering(df_synth):
     # 5. Follow-up must be >= discharge
     clamp_after(disc, fu, min_offset_days=1)
 
+    # FIX 6: Cap follow-up at 365 days after operation to prevent extreme outliers
+    op_dt = to_dt(op)
+    fu_dt = to_dt(fu)
+    if op_dt is not None and fu_dt is not None:
+        max_fu = op_dt + pd.Timedelta(days=365)
+        too_far = fu_dt.notna() & op_dt.notna() & (fu_dt > max_fu)
+        df_synth.loc[too_far, fu] = max_fu[too_far].dt.strftime('%Y-%m-%d')
+
     # 6. Stop-of-operation must be same day as start
     stop_op = 'Stop of operation date (YYYY-MM-DD)::72'
     clamp_after(op, stop_op, min_offset_days=0)
@@ -343,7 +355,7 @@ def enforce_tnm_staging_rules(df_synth):
 # ==========================================
 
 def enforce_realistic_bounds(df_synth):
-    print("Enforcing realistic domain bounds...")
+    print("Enforcing realistic domain bounds and clinical precision...")
 
     # Time-to-event: Bulletproof Nullable Int Casting
     for col, (lo, hi) in TIME_EVENT_BOUNDS.items():
@@ -351,6 +363,22 @@ def enforce_realistic_bounds(df_synth):
             vals = pd.to_numeric(df_synth[col], errors='coerce')
             clipped_vals = vals.clip(lower=lo, upper=hi).round()
             df_synth[col] = pd.to_numeric(clipped_vals, errors='coerce').astype('Int64')
+
+    # FIX 3: Height Precision (Strictly 1 decimal)
+    height_col = 'Height (cm)::23'
+    if height_col in df_synth.columns:
+        df_synth[height_col] = pd.to_numeric(df_synth[height_col], errors='coerce').round(1)
+
+    # FIX 2: VAS Pain/Nausea Scores (Strictly Integers 0-10)
+    vas_cols = [c for c in df_synth.columns if 'VAS' in c]
+    for col in vas_cols:
+        df_synth[col] = pd.to_numeric(df_synth[col], errors='coerce').clip(lower=0, upper=10).round().astype('Int64')
+
+    # FIX 1: Phantom Oral Fluids & Supplements (Strictly Integers)
+    oral_cols = [c for c in df_synth.columns if 'Oral fluids' in c or 'Oral nutritional supplements' in c]
+    for col in oral_cols:
+        # Snap any negative noise to 0, and force to integer
+        df_synth[col] = pd.to_numeric(df_synth[col], errors='coerce').clip(lower=0).round().astype('Int64')
 
     # Weight change per post-op day
     weight_change_cols = [
@@ -363,15 +391,22 @@ def enforce_realistic_bounds(df_synth):
         if col in df_synth.columns:
             df_synth[col] = pd.to_numeric(df_synth[col], errors='coerce').clip(lower=lo, upper=hi)
 
-    # Fluid volumes
+    # FIX 4: Tiny Colloid/Blood Volumes (Snap noise to 0, cast to Int)
     for col, (lo, hi) in FLUID_BOUNDS.items():
         if col in df_synth.columns:
-            df_synth[col] = pd.to_numeric(df_synth[col], errors='coerce').clip(lower=lo, upper=hi)
+            vals = pd.to_numeric(df_synth[col], errors='coerce').clip(lower=lo, upper=hi)
+            
+            # If the GAN output a tiny noise float for blood/colloids (e.g., 17.2ml), snap it to 0
+            if 'colloids' in col.lower() or 'blood' in col.lower():
+                vals[vals < 30] = 0
+                
+            # Fluids are measured in whole ml, so round and cast to integer
+            df_synth[col] = vals.round().astype('Int64')
 
     # Core body temperature
     temp_col = 'Core body temperature at end of operation (°C)::95'
     if temp_col in df_synth.columns:
-        df_synth[temp_col] = pd.to_numeric(df_synth[temp_col], errors='coerce').clip(lower=34.0, upper=42.0)
+        df_synth[temp_col] = pd.to_numeric(df_synth[temp_col], errors='coerce').clip(lower=34.0, upper=42.0).round(1)
 
     # BMI: implausible values
     bmi_col = 'BMI::24'
@@ -384,6 +419,13 @@ def enforce_realistic_bounds(df_synth):
                 'Morning weight - On postoperative day 3 (kg)::114']:
         if col in df_synth.columns:
             df_synth[col] = pd.to_numeric(df_synth[col], errors='coerce').clip(lower=30.0, upper=300.0)
+    
+    # FIX 1: Clean up all phantom floats in volume and energy columns
+    ml_kcal_cols = [c for c in df_synth.columns if '(ml)' in c.lower() or '(kcal)' in c.lower()]
+    for col in ml_kcal_cols:
+        if col in df_synth.columns:
+            # Strip quotes if they exist in the column name, convert to numeric, round, and cast
+            df_synth[col] = pd.to_numeric(df_synth[col], errors='coerce').round(0).astype('Int64')
 
     return df_synth
 
@@ -435,6 +477,16 @@ def enforce_native_dependencies(df_synth):
     # ==========================================
     op_idx = 'Date of primary operation (YYYY-MM-DD)::53'
 
+    # FIX 4: Stop of Operation Time Plausibility (Prevent 00:00 artifacts)
+    start_col = 'Start of operation time (HH:mm)::71'
+    stop_col  = 'Stop of operation time (HH:mm)::943'
+    if start_col in df_synth.columns and stop_col in df_synth.columns:
+        start_mins = pd.to_datetime(df_synth[start_col], format='%H:%M', errors='coerce')
+        stop_mins  = pd.to_datetime(df_synth[stop_col],  format='%H:%M', errors='coerce')
+        # If stop <= start by more than 1 hour (and stop isn't past midnight), it's a GAN artifact
+        same_day_violation = (stop_mins <= start_mins) & (start_mins.dt.hour < 20) 
+        df_synth.loc[same_day_violation, stop_col] = np.nan
+
     # BMI: Weight / Height^2
     if all(c in df_synth.columns for c in ['BMI::24', 'Preoperative body weight (kg)::20', 'Height (cm)::23']):
         w = pd.to_numeric(df_synth['Preoperative body weight (kg)::20'], errors='coerce')
@@ -464,15 +516,65 @@ def enforce_native_dependencies(df_synth):
             df_synth['Length of stay (nights in hospital after primary operation)::179'] = \
                 calculate_nights_safe(op_idx, disc_idx)
 
-    # Intraoperative Fluids Sum - BULLETPROOF CASTING
-    if 'Total IV volume of fluids intra-operatively (ml)::101' in df_synth.columns:
-        cryst = pd.to_numeric(df_synth['IV volume of crystalloids intraoperatively (ml)::97'],  errors='coerce').fillna(0)
-        coll  = pd.to_numeric(df_synth['IV volume of colloids intraoperatively (ml)::99'],      errors='coerce').fillna(0)
-        blood = pd.to_numeric(df_synth['IV volume of blood products intra-operatively (ml)::100'], errors='coerce').fillna(0)
-        total_fluids = cryst + coll + blood
-        df_synth['Total IV volume of fluids intra-operatively (ml)::101'] = pd.to_numeric(
-            total_fluids.round(), errors='coerce'
-        ).astype('Int64')
+   # ==========================================
+    # 1. MATHEMATICAL HARD-LOCKS & MILESTONES
+    # ==========================================
+    op_idx = 'Date of primary operation (YYYY-MM-DD)::53'
+
+    # FIX 4: Stop of Operation Time Plausibility (Prevent 00:00 artifacts)
+    start_col = 'Start of operation time (HH:mm)::71'
+    stop_col  = 'Stop of operation time (HH:mm)::943'
+    if start_col in df_synth.columns and stop_col in df_synth.columns:
+        start_mins = pd.to_datetime(df_synth[start_col], format='%H:%M', errors='coerce')
+        stop_mins  = pd.to_datetime(df_synth[stop_col],  format='%H:%M', errors='coerce')
+        # If stop <= start by more than 1 hour (and stop isn't past midnight), it's a GAN artifact
+        same_day_violation = (stop_mins <= start_mins) & (start_mins.dt.hour < 20) 
+        df_synth.loc[same_day_violation, stop_col] = np.nan
+
+    # BMI: Weight / Height^2
+    # ... [Keep your existing BMI and Date-based milestones code] ...
+
+    # ==========================================
+    # FIX 2, 3, & 5: INTRAOPERATIVE FLUIDS LOGIC
+    # ==========================================
+    cryst_col = 'IV volume of crystalloids intraoperatively (ml)::97'
+    coll_col  = 'IV volume of colloids intraoperatively (ml)::99'
+    blood_col = 'IV volume of blood products intra-operatively (ml)::100'
+    intraop_col = 'Total IV volume of fluids intra-operatively (ml)::101'
+    day_zero_col = 'Total IV volume of fluids day zero (ml)::107'
+    
+    # Fuzzy match for postop column to avoid exact quote string bugs
+    postop_cols = [c for c in df_synth.columns if 'Intravenous fluids, volume infused - On day of surgery' in c]
+    postop_col = postop_cols[0] if postop_cols else None
+
+    # Step A: Crystalloid Consistency Check (Fix 5)
+    if cryst_col in df_synth.columns and intraop_col in df_synth.columns:
+        cryst = pd.to_numeric(df_synth[cryst_col], errors='coerce').fillna(0)
+        total = pd.to_numeric(df_synth[intraop_col], errors='coerce').fillna(0)
+        coll  = pd.to_numeric(df_synth.get(coll_col, 0), errors='coerce').fillna(0)
+        blood = pd.to_numeric(df_synth.get(blood_col, 0), errors='coerce').fillna(0)
+        
+        # If total > 0 but components are 0, crystalloid inherits the total
+        underspecified = (cryst == 0) & (coll == 0) & (blood == 0) & (total > 0)
+        df_synth.loc[underspecified, cryst_col] = total[underspecified]
+
+    # Step B: Recalculate Intraoperative Total (Fix 2 - Clip to >= 0)
+    if intraop_col in df_synth.columns:
+        cryst = pd.to_numeric(df_synth[cryst_col], errors='coerce').fillna(0)
+        coll  = pd.to_numeric(df_synth.get(coll_col, 0), errors='coerce').fillna(0)
+        blood = pd.to_numeric(df_synth.get(blood_col, 0), errors='coerce').fillna(0)
+        
+        intraop_total = (cryst + coll + blood).clip(lower=0).round()
+        df_synth[intraop_col] = pd.to_numeric(intraop_total, errors='coerce').astype('Int64')
+
+    # Step C: Recalculate Day Zero Total (Fix 3 - Sum and Cap at 8000)
+    if postop_col and day_zero_col in df_synth.columns and intraop_col in df_synth.columns:
+        intraop = pd.to_numeric(df_synth[intraop_col], errors='coerce').fillna(0)
+        postop  = pd.to_numeric(df_synth[postop_col], errors='coerce').fillna(0)
+        
+        # Total must logically sum its parts, but we cap it at an extreme of 8000ml to prevent GAN outliers
+        day_zero_total = (intraop + postop).clip(lower=0, upper=8000).round()
+        df_synth[day_zero_col] = pd.to_numeric(day_zero_total, errors='coerce').astype('Int64')
 
     # ==========================================
     # 2. PRE-OP SKIP-LOGIC
@@ -514,6 +616,29 @@ def enforce_native_dependencies(df_synth):
     # 3. INTRA-OP & ANAESTHESIA
     # ==========================================
     wipe_if_negative('Anastomosis::66', ['Type of anastomosis::67', 'Anastomotic technique::68'])
+    
+    # FIX 5: Ensure details exist when Anastomosis == "Yes"
+    ana_col = 'Anastomosis::66'
+    type_col = 'Type of anastomosis::67'
+    tech_col = 'Anastomotic technique::68'
+    
+    if all(c in df_synth.columns for c in [ana_col, type_col, tech_col]):
+        # Find rows where Anastomosis is Yes
+        is_yes = df_synth[ana_col].astype(str).str.strip().str.lower().isin(['yes', 'true', '1'])
+        
+        # 1. Fill missing Types
+        missing_type = is_yes & df_synth[type_col].isna()
+        if missing_type.any():
+            valid_types = df_synth.loc[df_synth[type_col].notna() & (df_synth[type_col] != ''), type_col]
+            if not valid_types.empty:
+                df_synth.loc[missing_type, type_col] = valid_types.sample(missing_type.sum(), replace=True).values
+                
+        # 2. Fill missing Techniques
+        missing_tech = is_yes & df_synth[tech_col].isna()
+        if missing_tech.any():
+            valid_techs = df_synth.loc[df_synth[tech_col].notna() & (df_synth[tech_col] != ''), tech_col]
+            if not valid_techs.empty:
+                df_synth.loc[missing_tech, tech_col] = valid_techs.sample(missing_tech.sum(), replace=True).values
     wipe_if_negative('General anaesthesia::81', [
         'Airway control::85', 'Depth of anaesthesia monitored::84',
         'Nitrous oxide used::82', 'Deep neuromuscular blockade::86',
@@ -659,6 +784,12 @@ def enforce_native_dependencies(df_synth):
         ].notna()
         df_synth.loc[valid_p, 'Total length of stay (nights)::353'] = \
             pd.to_numeric((p_los[valid_p] + r_los[valid_p]).round(), errors='coerce').astype('Int64')
+    
+    ml_kcal_cols = [c for c in df_synth.columns if '(ml)' in c.lower() or '(kcal)' in c.lower() or c.endswith('(ml)::106"')]
+    for col in ml_kcal_cols:
+        if col in df_synth.columns:
+            # Force to numeric, round, and hard-cast to nullable integer
+            df_synth[col] = pd.to_numeric(df_synth[col], errors='coerce').round(0).astype('Int64')
 
     return df_synth
 
