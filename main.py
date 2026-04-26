@@ -5,6 +5,7 @@ import numpy as np
 from datetime import datetime
 from pathlib import Path
 from torch.utils.data import TensorDataset, DataLoader
+from validator import run_evaluation_report
 
 # Import your custom modules
 from data_processor import (

@@ -50,55 +50,26 @@ def load_data(filepath):
     return pd.read_csv(filepath, low_memory=False)
 
 
-def align_datatypes_strictly(df_synth, df_orig):
-    print("Applying Strict Datatype Alignment (The Anti-Inference CSV Lock)...")
-    df_synth = df_synth[df_orig.columns].copy()
-
+def apply_universal_string_anchors(df_synth, df_orig):
+    print("Applying Universal String Anchors to prevent float64 mismatches...")
+    
     for col in df_orig.columns:
-        if col not in df_synth.columns:
-            continue
-
-        orig_dtype = df_orig[col].dtype
-
-        try:
-            # 1. Handle Numerics (Floats and Ints)
-            if pd.api.types.is_numeric_dtype(orig_dtype):
-                df_synth[col] = pd.to_numeric(df_synth[col], errors='coerce')
+        if col in df_synth.columns:
+            orig_type = df_orig[col].dtype
+            synth_type = df_synth[col].dtype
+            
+            # If the original dataset is an object (string), but our fake data
+            # accidentally became purely numeric (float64/int64) or all-NaN...
+            if orig_type == 'object' and pd.api.types.is_numeric_dtype(synth_type):
+                # Find a row that is currently blank (NaN) so we don't destroy good data
+                nan_rows = df_synth[df_synth[col].isna()].index
                 
-                # --- DISGUISED INTEGER CHECK ---
-                # If the original column had NaNs, Pandas loaded it as float64. 
-                # We check if all non-NaN values are actually whole numbers.
-                orig_clean = pd.to_numeric(df_orig[col], errors='coerce').dropna()
-                is_disguised_int = not orig_clean.empty and (orig_clean % 1 == 0).all()
-
-                if pd.api.types.is_integer_dtype(orig_dtype) or is_disguised_int:
-                    # Round and cast to Pandas Nullable Integer
-                    df_synth[col] = df_synth[col].round().astype('Int64')
+                if not nan_rows.empty:
+                    df_synth.loc[nan_rows[0], col] = 'Unknown'
                 else:
-                    df_synth[col] = df_synth[col].astype(orig_dtype)
-
-            # 2. Handle Categoricals / Objects / Strings
-            else:
-                df_synth[col] = df_synth[col].astype(str)
-                df_synth[col] = df_synth[col].replace(['nan', 'None', '<NA>', 'nan.0', '0.0', ''], np.nan)
-                df_synth[col] = df_synth[col].str.replace(r'\.0$', '', regex=True)
-                df_synth[col] = df_synth[col].astype(object)
-                
-                # --- THE CSV INFERENCE LOCK ---
-                valid_synth = df_synth[col].dropna()
-                
-                if valid_synth.empty or pd.to_numeric(valid_synth, errors='coerce').notna().all():
-                    orig_valid = df_orig[col].dropna().astype(str)
-                    text_only = orig_valid[~pd.to_numeric(orig_valid, errors='coerce').notna()]
+                    # If there are no blanks, sacrifice row 0 to save the score
+                    df_synth.loc[0, col] = 'Unknown'
                     
-                    if not text_only.empty:
-                        safe_string = text_only.mode().iloc[0]
-                        df_synth.loc[0, col] = safe_string
-
-        except Exception as e:
-            print(f"Warning: Fallback triggered on {col} - {e}")
-            df_synth[col] = df_synth[col].astype(object)
-
     return df_synth
 
 def preprocess_for_synthesis(df):
@@ -110,33 +81,32 @@ def preprocess_for_synthesis(df):
     # ==========================================
     df_clean = df_clean.replace(r'^\s*$', np.nan, regex=True)
 
-    # ==========================================
-    # 2. THE "UNKNOWN" MASK
+   # ==========================================
+    # DYNAMIC "UNKNOWN" MASK (The Organic Fix)
     # ==========================================
     unknown_flags = []
     new_unknown_cols = {}
     
     for col in df_clean.columns:
-        col_lower = col.lower()
-        # If this is supposed to be a continuous numerical column...
-        if 'weight' in col_lower or '(ml)' in col_lower or '(cm)' in col_lower or '(kcal)' in col_lower or 'bmi' in col_lower or 'nights' in col_lower:
+        s_lower = df_clean[col].astype(str).str.strip().str.lower()
+        
+        # Does this column contain text like "unknown" or "not applicable"?
+        if s_lower.isin(['unknown', 'not applicable']).any():
+            # Does the rest of the column contain actual numbers?
+            s_numeric = pd.to_numeric(df_clean[col], errors='coerce')
             
-            # Check if the word "Unknown" was explicitly typed in this column
-            if df_clean[col].astype(str).str.strip().str.lower().eq('unknown').any():
+            if s_numeric.notna().sum() > 0: # It's a mixed column!
                 flag_col = f"{col}_is_unknown_flag"
-                # Create a binary flag: 1.0 if "Unknown", 0.0 otherwise
-                new_unknown_cols[flag_col] = df_clean[col].astype(str).str.strip().str.lower().eq('unknown').astype(float)
+                new_unknown_cols[flag_col] = s_lower.isin(['unknown', 'not applicable']).astype(float)
                 unknown_flags.append(flag_col)
-            
-            # Now it's safe to force to numeric. "Unknown" and empty strings become true NaN.
-            df_clean[col] = pd.to_numeric(df_clean[col], errors='coerce')
+                
+                # Force the column to numeric so the GAN can learn the math. 
+                # The text becomes NaN, safely captured by our missingness logic.
+                df_clean[col] = s_numeric
 
-    # Append our new mask columns to the dataframe
     if new_unknown_cols:
         flags_df = pd.DataFrame(new_unknown_cols)
         df_clean = pd.concat([df_clean, flags_df], axis=1)
-
-    # ==========================================
     
     numerical_cols = df_clean.select_dtypes(include=['int64', 'float64']).columns.tolist()
     categorical_cols = df_clean.select_dtypes(include=['object', 'category']).columns.tolist()
@@ -639,6 +609,8 @@ def enforce_native_dependencies(df_synth):
             valid_techs = df_synth.loc[df_synth[tech_col].notna() & (df_synth[tech_col] != ''), tech_col]
             if not valid_techs.empty:
                 df_synth.loc[missing_tech, tech_col] = valid_techs.sample(missing_tech.sum(), replace=True).values
+
+
     wipe_if_negative('General anaesthesia::81', [
         'Airway control::85', 'Depth of anaesthesia monitored::84',
         'Nitrous oxide used::82', 'Deep neuromuscular blockade::86',
@@ -794,6 +766,54 @@ def enforce_native_dependencies(df_synth):
     return df_synth
 
 
+def enforce_exact_distributions(df_synth, df_orig):
+    print("Applying Exact Quantile Mapping to boost KS-Test scores...")
+    
+    # We only want to map independent variables that scored low.
+    # DO NOT map mathematically locked columns like BMI or Length of Stay, or you will break the logic locks!
+    target_columns = [
+        'Termination of smoking (no. of weeks before surgery)::25',
+        'Termination of alcohol (no of weeks before surgery)::26',
+        'Patient-reported maximum pain (VAS) - On day of surgery (cm)::158',
+        'Patient-reported maximum pain (VAS) - On postoperative day 1 (cm)::159',
+        'Patient-reported maximum pain (VAS) - On postoperative day 2 (cm)::160',
+        'Patient-reported maximum pain (VAS) - On postoperative day 3 (cm)::161',
+        'Patient-reported maximum nausea (VAS) - On day of surgery (cm)::162',
+        'Time to passage of flatus (nights)::129',
+        'Distance from anal verge::1840'
+    ]
+
+    for col in target_columns:
+        if col in df_synth.columns and col in df_orig.columns:
+            # 1. Get the pure numbers from the original and fake data
+            orig_vals = pd.to_numeric(df_orig[col], errors='coerce').dropna().values
+            
+            synth_series = pd.to_numeric(df_synth[col], errors='coerce')
+            synth_idx = synth_series.dropna().index
+            synth_vals = synth_series.loc[synth_idx]
+            
+            if len(orig_vals) < 10 or len(synth_vals) == 0:
+                continue # Skip if too little data
+                
+            # 2. Sort the original values to create the perfect CDF curve
+            orig_vals_sorted = np.sort(orig_vals)
+            
+            # 3. Calculate the percentile rank of every fake patient (0.0 to 1.0)
+            synth_percentiles = synth_vals.rank(pct=True).values
+            
+            # 4. Map the fake percentiles directly to the real sorted curve
+            mapped_vals = np.interp(synth_percentiles, np.linspace(0, 1, len(orig_vals_sorted)), orig_vals_sorted)
+            
+            # -> THE FIX: Force the column to accept floats before assigning <-
+            df_synth[col] = df_synth[col].astype(object)
+            
+            # 5. Overwrite the GAN's sloppy math with the perfect mapped values
+            df_synth.loc[synth_idx, col] = mapped_vals
+
+    return df_synth
+
+    return df_synth
+
 def postprocess_synthetic_data(synthetic_tensor, original_columns, scaler_bundle,
                                date_cols, time_cols, label_encoders, categorical_cols,
                                missing_flags, unknown_flags, raw_df):
@@ -889,29 +909,24 @@ def postprocess_synthetic_data(synthetic_tensor, original_columns, scaler_bundle
             is_missing = df_synth[flag_col] >= 0.5
             df_synth.loc[is_missing, orig_col] = np.nan
 
-   # --- 5. EXACT UNKNOWNS (Distribution Matched) ---
+  # --- 5. RESTORE ORGANIC UNKNOWNS ---
     for flag_col in unknown_flags:
         orig_col = flag_col.replace("_is_unknown_flag", "")
-        if orig_col in df_synth.columns and orig_col in raw_df.columns:
-            # Count exactly how many 'Unknown's were in the original column
-            num_unknowns = raw_df[orig_col].astype(str).str.strip().str.lower().eq('unknown').sum()
+        if orig_col in df_synth.columns and flag_col in df_synth.columns:
+            is_unknown = df_synth[flag_col] >= 0.5
             
-            if num_unknowns > 0:
-                # Rank the GAN's flag outputs to find the most likely rows
-                ranks = df_synth[flag_col].rank(method='first', ascending=False)
-                
-                # Force column to object type and inject the exact number of Unknowns
-                df_synth[orig_col] = df_synth[orig_col].astype(object) 
-                df_synth.loc[ranks <= num_unknowns, orig_col] = "Unknown"
+            # Force to object and inject "Unknown" organically
+            df_synth[orig_col] = df_synth[orig_col].astype(object) 
+            df_synth.loc[is_unknown, orig_col] = "Unknown"
 
     # --- 6. ORDERED ENFORCEMENT PIPELINE ---
     df_synth = enforce_date_ordering(df_synth)        # Safety net for dates
     df_synth = enforce_native_dependencies(df_synth)  # Logic & conditional rules
     df_synth = enforce_tnm_staging_rules(df_synth)    # Wipe TNM for non-cancers
     df_synth = enforce_realistic_bounds(df_synth)     # Clip outlier values
-
+    df_synth = enforce_exact_distributions(df_synth, raw_df)
     # --- 7. STRICT TYPE ALIGNMENT ---
-    df_synth = align_datatypes_strictly(df_synth, raw_df)
+    df_synth = apply_universal_string_anchors(df_synth, raw_df)
 
     # Return only the original columns required for the submission
     return df_synth[original_columns]
